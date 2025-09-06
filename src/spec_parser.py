@@ -1,0 +1,400 @@
+"""
+OpenAPI Specification Parser and Validator
+
+This module handles parsing, validation, and extraction of OpenAPI specifications
+from URLs or file paths. It provides structured access to endpoints, schemas,
+and metadata needed for dependency analysis.
+"""
+
+import json
+import yaml
+import requests
+from typing import Dict, List, Optional, Union, Any
+from urllib.parse import urlparse, urljoin
+from pathlib import Path
+import logging
+from dataclasses import dataclass
+from openapi_spec_validator import validate_spec
+try:
+    from openapi_spec_validator.readers import read_from_filename
+except ImportError:
+    # Fallback for older versions or if readers module is not available
+    read_from_filename = None
+
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class EndpointInfo:
+    """Structured information about an API endpoint."""
+    service_name: str
+    method: str
+    path: str
+    operation_id: Optional[str]
+    summary: Optional[str]
+    description: Optional[str]
+    parameters: List[Dict[str, Any]]
+    request_body: Optional[Dict[str, Any]]
+    responses: Dict[str, Dict[str, Any]]
+    tags: List[str]
+    security: List[Dict[str, Any]]
+    examples: Dict[str, Any]
+    
+    @property
+    def endpoint_id(self) -> str:
+        """Unique identifier for this endpoint."""
+        return f"{self.service_name}:{self.method.upper()}:{self.path}"
+
+
+@dataclass
+class SchemaInfo:
+    """Information about OpenAPI schemas/models."""
+    name: str
+    schema: Dict[str, Any]
+    service_name: str
+    properties: Dict[str, Any]
+    required_fields: List[str]
+
+
+@dataclass
+class ServiceSpec:
+    """Complete parsed OpenAPI specification for a service."""
+    service_name: str
+    base_url: str
+    spec: Dict[str, Any]
+    endpoints: List[EndpointInfo]
+    schemas: List[SchemaInfo]
+    version: str
+    title: str
+    description: Optional[str]
+
+
+class SpecParser:
+    """OpenAPI specification parser and validator."""
+    
+    def __init__(self):
+        self.session = requests.Session()
+        self.session.timeout = 30
+        
+    def parse_specs(self, spec_sources: List[str]) -> List[ServiceSpec]:
+        """
+        Parse multiple OpenAPI specifications from URLs or file paths.
+        
+        Args:
+            spec_sources: List of URLs or file paths to OpenAPI specs
+            
+        Returns:
+            List of parsed ServiceSpec objects
+        """
+        service_specs = []
+        
+        for source in spec_sources:
+            try:
+                logger.info(f"Parsing spec from: {source}")
+                spec = self._load_spec(source)
+                service_spec = self._parse_single_spec(source, spec)
+                service_specs.append(service_spec)
+                logger.info(f"Successfully parsed {service_spec.service_name}")
+            except Exception as e:
+                logger.error(f"Failed to parse spec from {source}: {e}")
+                continue
+                
+        return service_specs
+    
+    def _load_spec(self, source: str) -> Dict[str, Any]:
+        """Load OpenAPI spec from URL or file path."""
+        if self._is_url(source):
+            return self._load_from_url(source)
+        else:
+            return self._load_from_file(source)
+    
+    def _is_url(self, source: str) -> bool:
+        """Check if source is a URL."""
+        try:
+            result = urlparse(source)
+            return bool(result.scheme and result.netloc)
+        except:
+            return False
+    
+    def _load_from_url(self, url: str) -> Dict[str, Any]:
+        """Load spec from URL."""
+        # Direct request approach since read_from_url is not available in current versions
+        response = self.session.get(url)
+        response.raise_for_status()
+        
+        content_type = response.headers.get('content-type', '')
+        if 'json' in content_type:
+            spec_dict = response.json()
+        else:
+            spec_dict = yaml.safe_load(response.text)
+        
+        # Validate the spec
+        validate_spec(spec_dict)
+        return spec_dict
+    
+    def _load_from_file(self, file_path: str) -> Dict[str, Any]:
+        """Load spec from file path."""
+        if read_from_filename is not None:
+            try:
+                spec_dict, _ = read_from_filename(file_path)
+                validate_spec(spec_dict)
+                return spec_dict
+            except Exception as e:
+                logger.warning(f"Failed with read_from_filename, trying direct file read: {e}")
+        
+        # Fallback to direct file reading
+        with open(file_path, 'r', encoding='utf-8') as f:
+            if file_path.lower().endswith(('.yaml', '.yml')):
+                spec_dict = yaml.safe_load(f)
+            else:
+                spec_dict = json.load(f)
+        
+        # Validate the spec
+        validate_spec(spec_dict)
+        return spec_dict
+    
+    def _parse_single_spec(self, source: str, spec: Dict[str, Any]) -> ServiceSpec:
+        """Parse a single OpenAPI specification."""
+        # Extract service name from URL or file path
+        service_name = self._extract_service_name(source, spec)
+        
+        # Extract base URL
+        base_url = self._extract_base_url(source, spec)
+        
+        # Parse endpoints
+        endpoints = self._parse_endpoints(service_name, spec)
+        
+        # Parse schemas
+        schemas = self._parse_schemas(service_name, spec)
+        
+        return ServiceSpec(
+            service_name=service_name,
+            base_url=base_url,
+            spec=spec,
+            endpoints=endpoints,
+            schemas=schemas,
+            version=spec.get('info', {}).get('version', '1.0.0'),
+            title=spec.get('info', {}).get('title', service_name),
+            description=spec.get('info', {}).get('description')
+        )
+    
+    def _extract_service_name(self, source: str, spec: Dict[str, Any]) -> str:
+        """Extract service name from source or spec."""
+        # Try to get from spec title
+        title = spec.get('info', {}).get('title', '')
+        if title:
+            # Clean up title to make it a valid service name
+            service_name = title.lower().replace(' ', '-').replace('_', '-')
+            if service_name:
+                return service_name
+        
+        # Extract from URL path
+        if self._is_url(source):
+            path_parts = urlparse(source).path.strip('/').split('/')
+            for part in reversed(path_parts):
+                if part and part not in ['api-docs', 'swagger.json', 'openapi.json']:
+                    return part
+        
+        # Extract from file path
+        else:
+            path = Path(source)
+            return path.stem
+        
+        return 'unknown-service'
+    
+    def _extract_base_url(self, source: str, spec: Dict[str, Any]) -> str:
+        """Extract base URL for the service."""
+        # Try servers from spec
+        servers = spec.get('servers', [])
+        if servers:
+            return servers[0].get('url', '')
+        
+        # Extract from source URL
+        if self._is_url(source):
+            parsed = urlparse(source)
+            # Remove /v3/api-docs or similar paths
+            path_parts = parsed.path.strip('/').split('/')
+            clean_parts = []
+            for part in path_parts:
+                if part in ['v3', 'api-docs', 'swagger.json', 'openapi.json']:
+                    break
+                clean_parts.append(part)
+            
+            clean_path = '/' + '/'.join(clean_parts) if clean_parts else ''
+            return f"{parsed.scheme}://{parsed.netloc}{clean_path}"
+        
+        return 'http://localhost:8080'
+    
+    def _parse_endpoints(self, service_name: str, spec: Dict[str, Any]) -> List[EndpointInfo]:
+        """Parse all endpoints from the OpenAPI spec."""
+        endpoints = []
+        paths = spec.get('paths', {})
+        
+        for path, path_item in paths.items():
+            for method, operation in path_item.items():
+                if method.lower() in ['get', 'post', 'put', 'patch', 'delete', 'head', 'options']:
+                    endpoint = self._parse_endpoint(service_name, path, method, operation)
+                    endpoints.append(endpoint)
+        
+        return endpoints
+    
+    def _parse_endpoint(self, service_name: str, path: str, method: str, operation: Dict[str, Any]) -> EndpointInfo:
+        """Parse a single endpoint operation."""
+        # Extract parameters
+        parameters = []
+        for param in operation.get('parameters', []):
+            parameters.append({
+                'name': param.get('name'),
+                'in': param.get('in'),  # query, header, path, cookie
+                'required': param.get('required', False),
+                'schema': param.get('schema', {}),
+                'description': param.get('description')
+            })
+        
+        # Extract request body
+        request_body = operation.get('requestBody')
+        if request_body:
+            request_body = {
+                'required': request_body.get('required', False),
+                'content': request_body.get('content', {}),
+                'description': request_body.get('description')
+            }
+        
+        # Extract responses
+        responses = {}
+        for status_code, response in operation.get('responses', {}).items():
+            responses[status_code] = {
+                'description': response.get('description'),
+                'content': response.get('content', {}),
+                'headers': response.get('headers', {})
+            }
+        
+        # Extract examples
+        examples = self._extract_examples(operation)
+        
+        return EndpointInfo(
+            service_name=service_name,
+            method=method.upper(),
+            path=path,
+            operation_id=operation.get('operationId'),
+            summary=operation.get('summary'),
+            description=operation.get('description'),
+            parameters=parameters,
+            request_body=request_body,
+            responses=responses,
+            tags=operation.get('tags', []),
+            security=operation.get('security', []),
+            examples=examples
+        )
+    
+    def _parse_schemas(self, service_name: str, spec: Dict[str, Any]) -> List[SchemaInfo]:
+        """Parse schema definitions from the spec."""
+        schemas = []
+        
+        # OpenAPI 3.x schemas
+        components = spec.get('components', {})
+        schema_defs = components.get('schemas', {})
+        
+        for schema_name, schema_def in schema_defs.items():
+            schema_info = SchemaInfo(
+                name=schema_name,
+                schema=schema_def,
+                service_name=service_name,
+                properties=schema_def.get('properties', {}),
+                required_fields=schema_def.get('required', [])
+            )
+            schemas.append(schema_info)
+        
+        # OpenAPI 2.x definitions (Swagger)
+        definitions = spec.get('definitions', {})
+        for schema_name, schema_def in definitions.items():
+            schema_info = SchemaInfo(
+                name=schema_name,
+                schema=schema_def,
+                service_name=service_name,
+                properties=schema_def.get('properties', {}),
+                required_fields=schema_def.get('required', [])
+            )
+            schemas.append(schema_info)
+        
+        return schemas
+    
+    def _extract_examples(self, operation: Dict[str, Any]) -> Dict[str, Any]:
+        """Extract examples from operation."""
+        examples = {}
+        
+        # Examples from request body
+        request_body = operation.get('requestBody', {})
+        content = request_body.get('content', {})
+        for media_type, media_info in content.items():
+            if 'example' in media_info:
+                examples[f'request_{media_type}'] = media_info['example']
+            if 'examples' in media_info:
+                for ex_name, ex_data in media_info['examples'].items():
+                    examples[f'request_{media_type}_{ex_name}'] = ex_data.get('value')
+        
+        # Examples from responses
+        responses = operation.get('responses', {})
+        for status_code, response in responses.items():
+            response_content = response.get('content', {})
+            for media_type, media_info in response_content.items():
+                if 'example' in media_info:
+                    examples[f'response_{status_code}_{media_type}'] = media_info['example']
+                if 'examples' in media_info:
+                    for ex_name, ex_data in media_info['examples'].items():
+                        examples[f'response_{status_code}_{media_type}_{ex_name}'] = ex_data.get('value')
+        
+        return examples
+    
+    def get_endpoint_by_id(self, service_specs: List[ServiceSpec], endpoint_id: str) -> Optional[EndpointInfo]:
+        """Find endpoint by its unique ID."""
+        for service_spec in service_specs:
+            for endpoint in service_spec.endpoints:
+                if endpoint.endpoint_id == endpoint_id:
+                    return endpoint
+        return None
+    
+    def get_schema_by_name(self, service_specs: List[ServiceSpec], schema_name: str, service_name: Optional[str] = None) -> Optional[SchemaInfo]:
+        """Find schema by name, optionally filtering by service."""
+        for service_spec in service_specs:
+            if service_name and service_spec.service_name != service_name:
+                continue
+            for schema in service_spec.schemas:
+                if schema.name == schema_name:
+                    return schema
+        return None
+
+
+def main():
+    """Example usage of the SpecParser."""
+    import sys
+    
+    if len(sys.argv) < 2:
+        print("Usage: python spec_parser.py <spec_url_or_path> [<spec_url_or_path> ...]")
+        sys.exit(1)
+    
+    # Configure logging
+    logging.basicConfig(level=logging.INFO)
+    
+    parser = SpecParser()
+    specs = parser.parse_specs(sys.argv[1:])
+    
+    print(f"\nParsed {len(specs)} service specifications:")
+    for spec in specs:
+        print(f"\nService: {spec.service_name}")
+        print(f"  Title: {spec.title}")
+        print(f"  Version: {spec.version}")
+        print(f"  Base URL: {spec.base_url}")
+        print(f"  Endpoints: {len(spec.endpoints)}")
+        print(f"  Schemas: {len(spec.schemas)}")
+        
+        print("  Endpoints:")
+        for endpoint in spec.endpoints[:5]:  # Show first 5
+            print(f"    {endpoint.method} {endpoint.path}")
+        if len(spec.endpoints) > 5:
+            print(f"    ... and {len(spec.endpoints) - 5} more")
+
+
+if __name__ == "__main__":
+    main() 
