@@ -91,9 +91,9 @@ pip install tensorboard rich tqdm
 ```bash
 # With running services
 python main.py generate \
-  http://localhost:8060/employee/v3/api-docs \
-  http://localhost:8060/department/v3/api-docs \
-  http://localhost:8060/organization/v3/api-docs
+  http://localhost:8080/service-a/v3/api-docs \
+http://localhost:8080/service-b/v3/api-docs \
+http://localhost:8080/service-c/v3/api-docs
 
 # Or test with sample spec file
 python main.py generate examples/sample_openapi.yaml
@@ -108,8 +108,8 @@ Generate test suite from OpenAPI specs:
 ```bash
 # From URLs
 python main.py generate \
-  http://localhost:8060/employee/v3/api-docs \
-  http://localhost:8060/department/v3/api-docs \
+  http://localhost:8080/service-a/v3/api-docs \
+  http://localhost:8080/service-b/v3/api-docs \
   --output my_test_suite.json
 
 # From local files
@@ -120,9 +120,9 @@ python main.py generate specs/*.yaml --output local_tests.json
 
 ```bash
 python main.py generate \
-  http://localhost:8060/employee/v3/api-docs \
-  http://localhost:8060/department/v3/api-docs \
-  --base-url http://localhost:8060 \
+  http://localhost:8080/service-a/v3/api-docs \
+  http://localhost:8080/service-b/v3/api-docs \
+  --base-url http://localhost:8080 \
   --training-steps 20000 \
   --num-sequences 10 \
   --max-sequence-length 30 \
@@ -151,8 +151,8 @@ Analyze dependencies without generating test suites:
 
 ```bash
 python main.py analyze \
-  http://localhost:8060/employee/v3/api-docs \
-  http://localhost:8060/department/v3/api-docs \
+  http://localhost:8080/service-a/v3/api-docs \
+  http://localhost:8080/service-b/v3/api-docs \
   --output dependency_analysis.json \
   --graph-output dependency_graph.dot
 ```
@@ -263,27 +263,27 @@ The system automatically detects:
 For a typical microservices architecture:
 
 ```
-Employee Service ──┐
-                   ├──▶ Organization Service
-Department Service ─┘
+Service C ──┐
+            ├──▶ Service A  
+Service B ──┘
 ```
 
 The system discovers:
-1. **Data Dependencies**: Employee creation returns ID used by Department endpoints
-2. **Sequence Requirements**: Organization must exist before Department creation
+1. **Data Dependencies**: Service creation returns ID used by other service endpoints
+2. **Sequence Requirements**: Parent resources must exist before child resource creation
 3. **Auth Dependencies**: All services require tokens from auth endpoints
-4. **Resource Hierarchies**: Departments belong to Organizations
+4. **Resource Hierarchies**: Child resources depend on parent resources
 
 ### Generated Test Sequence Example
 
 ```
 1. POST /auth/login → Extract auth token
-2. POST /organizations → Extract organization ID
-3. POST /departments → Use organization ID, extract department ID  
-4. POST /employees → Use department ID, extract employee ID
-5. GET /employees/{id} → Verify employee creation
-6. PUT /employees/{id} → Test employee updates
-7. DELETE /employees/{id} → Test cleanup sequence
+2. POST /resource-a → Extract resource A ID
+3. POST /resource-b → Use resource A ID, extract resource B ID  
+4. POST /resource-c → Use resource B ID, extract resource C ID
+5. GET /resource-c/{id} → Verify resource creation
+6. PUT /resource-c/{id} → Test resource updates
+7. DELETE /resource-c/{id} → Test cleanup sequence
 ```
 
 ## 🛠️ Development

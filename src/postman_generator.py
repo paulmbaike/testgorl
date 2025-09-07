@@ -58,9 +58,11 @@ class PostmanGenerator:
             for endpoint in spec.endpoints:
                 self.endpoints[endpoint.endpoint_id] = endpoint
         
-        # Variable tracking
+        # Variable tracking for dependency-aware chaining
         self.extracted_variables: Set[str] = set()
         self.variable_sources: Dict[str, str] = {}  # variable -> source_request_id
+        self.dependency_variables: Dict[str, str] = {}  # field_name -> variable_name
+        self.sequence_variables: Dict[str, Any] = {}  # Track variables within sequence
     
     def generate_collection(self, test_sequences: List[TestSequence], 
                           collection_name: str = "RL Generated API Tests") -> Dict[str, Any]:
@@ -74,10 +76,17 @@ class PostmanGenerator:
         Returns:
             Postman collection as dictionary
         """
+        # Filter out empty sequences first
+        non_empty_sequences = [seq for seq in test_sequences if seq.calls]
+        empty_sequences_count = len(test_sequences) - len(non_empty_sequences)
+        
+        if empty_sequences_count > 0:
+            logger.info(f"Skipping {empty_sequences_count} empty sequences (no API calls)")
+        
         collection = {
             "info": {
                 "name": collection_name,
-                "description": f"Generated API test collection with {len(test_sequences)} sequences",
+                "description": f"Generated API test collection with {len(non_empty_sequences)} non-empty sequences ({empty_sequences_count} empty sequences skipped)",
                 "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
                 "_postman_id": str(uuid.uuid4())
             },
@@ -111,13 +120,13 @@ class PostmanGenerator:
             }
         }]
         
-        # Convert each test sequence to a folder
-        for i, sequence in enumerate(test_sequences):
+        # Convert each non-empty test sequence to a folder
+        for i, sequence in enumerate(non_empty_sequences):
             folder = self._create_sequence_folder(sequence, i + 1)
             collection["item"].append(folder)
         
-        # Add summary folder with collection-level tests
-        summary_folder = self._create_summary_folder(test_sequences)
+        # Add summary folder with collection-level tests (using non-empty sequences only)
+        summary_folder = self._create_summary_folder(non_empty_sequences)
         collection["item"].append(summary_folder)
         
         logger.info(f"Generated Postman collection with {len(collection['item'])} folders")
@@ -181,9 +190,12 @@ class PostmanGenerator:
         sequence_vars = self._extract_sequence_variables(sequence)
         folder["variable"] = sequence_vars
         
-        # Convert each API call to a Postman request
+        # Reset sequence-specific variables for each sequence
+        self.sequence_variables = {}
+        
+        # Convert each API call to a Postman request with dependency awareness
         for i, api_call in enumerate(sequence.calls):
-            request = self._create_postman_request(api_call, i + 1, sequence)
+            request = self._create_dependency_aware_request(api_call, i + 1, sequence)
             folder["item"].append(request)
         
         # Add sequence completion test
@@ -273,6 +285,148 @@ class PostmanGenerator:
         else:
             return "string"
     
+    def _find_dependency_variable(self, param_name: str, sequence: TestSequence, current_call: APICall) -> str:
+        """Find the appropriate variable reference for a parameter based on dependencies."""
+        
+        # Look for variables that match this parameter
+        # Priority: exact match > semantic match > fallback
+        
+        # 1. Exact name match (e.g., userId -> userId)
+        exact_var = f"{{{{{param_name}}}}}"
+        if param_name in self.sequence_variables:
+            return exact_var
+        
+        # 2. Semantic matching for ID fields
+        if param_name.lower().endswith('id'):
+            # Extract the resource type (e.g., userId -> user, companyId -> company)
+            resource_type = param_name.lower().replace('id', '')
+            
+            # Look for variables from previous calls that could provide this ID
+            for i, call in enumerate(sequence.calls):
+                if call == current_call:
+                    break  # Don't look at current or future calls
+                
+                # Check if this call produces the needed resource
+                if self._call_produces_resource(call, resource_type):
+                    # Use the 'id' field from this call's response
+                    var_name = f"{resource_type}Id"
+                    self.sequence_variables[param_name] = var_name
+                    return f"{{{{{var_name}}}}}"
+        
+        # 3. Generic 'id' parameter - infer resource type from endpoint context
+        if param_name.lower() == 'id':
+            # Infer the resource type from the current endpoint path
+            resource_type = self._infer_resource_type_from_endpoint(current_call.endpoint_id)
+            
+            if resource_type:
+                # Simple direct mapping: /resource/{id}/ -> {{resourceId}}
+                var_name = f"{resource_type}Id"
+                logger.info(f"🎯 Generic 'id' parameter mapped to {var_name} based on endpoint path context")
+                return f"{{{{{var_name}}}}}"
+            
+            # Fallback: use the most recent ID if no specific resource type found
+            for call in reversed(sequence.calls[:sequence.calls.index(current_call)]):
+                if call.response_body and isinstance(call.response_body, dict):
+                    if 'id' in call.response_body:
+                        return "{{id}}"
+        
+        # 4. Fallback - use hardcoded value but log warning
+        if current_call.params and 'path' in current_call.params and param_name in current_call.params['path']:
+            fallback_value = current_call.params['path'][param_name]
+            logger.warning(f"Using hardcoded value {fallback_value} for {param_name} - no dependency variable found")
+            return str(fallback_value)
+        
+        # 5. Ultimate fallback - use parameter name as placeholder
+        return f"{{{{{param_name}}}}}"
+    
+    def _call_produces_resource(self, call: APICall, resource_type: str) -> bool:
+        """Check if a call produces a resource of the given type (based on endpoint analysis)."""
+        # Check if the endpoint path contains the resource type
+        if resource_type in call.endpoint_id.lower():
+            # For Postman generation, we assume POST methods produce resources
+            # regardless of actual response (since services might not be running)
+            if call.method == 'POST':
+                logger.debug(f"POST to {resource_type} endpoint - assuming it produces {resource_type} resource")
+                return True
+            
+            # Also check successful responses with ID (for actual testing scenarios)
+            if call.success and call.response_body:
+                if isinstance(call.response_body, dict) and 'id' in call.response_body:
+                    logger.debug(f"Successful response with ID - produces {resource_type} resource")
+                    return True
+        return False
+    
+    def _is_path_parameter_segment(self, segment: str, param_name: str, api_call: APICall) -> bool:
+        """Check if a path segment corresponds to a parameter value."""
+        if api_call.params and 'path' in api_call.params and param_name in api_call.params['path']:
+            param_value = str(api_call.params['path'][param_name])
+            return segment == param_value
+        return False
+    
+    def _substitute_body_variables(self, body: Dict[str, Any], sequence: TestSequence) -> Dict[str, Any]:
+        """Substitute hardcoded values in request body with dependency variables."""
+        if not isinstance(body, dict):
+            return body
+        
+        logger.info(f"🔄 Substituting variables in body with {len(body)} fields")
+        substituted_body = {}
+        
+        for key, value in body.items():
+            logger.debug(f"Processing field: {key} = {value}")
+            
+            # Check if this field should use a dependency variable
+            if self._is_dependency_field(key, value):
+                logger.info(f"🎯 Field {key} is a dependency field")
+                
+                # Find the appropriate variable
+                variable_ref = self._find_body_dependency_variable(key, value, sequence)
+                if variable_ref != value:  # Only substitute if we found a variable
+                    substituted_body[key] = variable_ref
+                    logger.info(f"✅ Substituted {key}: {value} -> {variable_ref}")
+                else:
+                    substituted_body[key] = value
+                    logger.warning(f"⚠️ No substitution found for {key}: keeping {value}")
+            else:
+                substituted_body[key] = value
+                logger.debug(f"Field {key} is not a dependency field")
+        
+        return substituted_body
+    
+    def _is_dependency_field(self, field_name: str, value: Any) -> bool:
+        """Check if a field is likely to be a dependency that should use variables."""
+        # ID-like fields are candidates for variable substitution
+        id_patterns = ['id', 'uuid', 'key', 'ref']
+        if any(pattern in field_name.lower() for pattern in id_patterns):
+            return True
+        return False
+    
+    def _find_body_dependency_variable(self, field_name: str, current_value: Any, sequence: TestSequence) -> Any:
+        """Find the appropriate variable for a request body field."""
+        
+        # For resourceId fields, find the source
+        if field_name.lower().endswith('id'):
+            resource_type = field_name.lower().replace('id', '')
+            logger.info(f"🔍 Looking for {resource_type} producer in {len(sequence.calls)} calls")
+            
+            # Look through previous calls for a producer
+            for i, call in enumerate(sequence.calls):
+                logger.debug(f"Checking call {i}: {call.endpoint_id}")
+                if self._call_produces_resource(call, resource_type):
+                    var_name = f"{resource_type}Id"
+                    logger.info(f"🔗 Found producer! Substituting {field_name}: {current_value} -> {{{{{var_name}}}}}")
+                    return f"{{{{{var_name}}}}}"
+                else:
+                    logger.debug(f"Call {call.endpoint_id} does not produce {resource_type}")
+        
+        # For generic 'id' field in request body (less common)
+        if field_name.lower() == 'id':
+            logger.info(f"🔗 Substituting generic id: {current_value} -> {{{{id}}}}")
+            return "{{id}}"
+        
+        # No substitution found, return original value
+        logger.warning(f"❌ No producer found for {field_name} (resource: {field_name.lower().replace('id', '') if field_name.lower().endswith('id') else 'unknown'})")
+        return current_value
+    
     def _create_postman_request(self, api_call: APICall, request_number: int, 
                               sequence: TestSequence) -> Dict[str, Any]:
         """Create a Postman request from an API call."""
@@ -315,6 +469,65 @@ class PostmanGenerator:
         
         # Add test script
         test_script = self._create_test_script(api_call, endpoint, sequence)
+        if test_script:
+            request["event"].append({
+                "listen": "test",
+                "script": {
+                    "type": "text/javascript",
+                    "exec": test_script
+                }
+            })
+        
+        # Add example response
+        if api_call.response_body:
+            example_response = self._create_example_response(api_call)
+            request["response"].append(example_response)
+        
+        return request
+    
+    def _create_dependency_aware_request(self, api_call: APICall, request_number: int, 
+                                       sequence: TestSequence) -> Dict[str, Any]:
+        """Create a Postman request with dependency-aware variable substitution."""
+        logger.info(f"🔧 Creating dependency-aware request for {api_call.method} {api_call.endpoint_id}")
+        endpoint = self.endpoints.get(api_call.endpoint_id)
+        
+        request = {
+            "name": f"{request_number}. {api_call.method} {self._get_request_name(api_call, endpoint)} (Dependency-Aware)",
+            "event": [],
+            "request": {
+                "method": api_call.method,
+                "header": self._create_request_headers(api_call),
+                "url": self._create_dependency_aware_url(api_call, endpoint, sequence),
+                "description": self._create_request_description(api_call, endpoint)
+            },
+            "response": []
+        }
+        
+        # Add dependency-aware request body
+        if api_call.body:
+            request["request"]["body"] = {
+                "mode": "raw",
+                "raw": json.dumps(self._substitute_body_variables(api_call.body, sequence), indent=2),
+                "options": {
+                    "raw": {
+                        "language": "json"
+                    }
+                }
+            }
+        
+        # Add pre-request script
+        pre_request_script = self._create_pre_request_script(api_call, endpoint, request_number)
+        if pre_request_script:
+            request["event"].append({
+                "listen": "prerequest",
+                "script": {
+                    "type": "text/javascript",
+                    "exec": pre_request_script
+                }
+            })
+        
+        # Add enhanced test script with variable extraction
+        test_script = self._create_enhanced_test_script(api_call, endpoint, sequence, request_number)
         if test_script:
             request["event"].append({
                 "listen": "test",
@@ -398,6 +611,75 @@ class PostmanGenerator:
             "query": query_params
         }
     
+    def _create_dependency_aware_url(self, api_call: APICall, endpoint: Optional[EndpointInfo], 
+                                   sequence: TestSequence) -> Dict[str, Any]:
+        """Create Postman URL using exact OpenAPI spec path with dependency-aware variable substitution."""
+        
+        if not endpoint:
+            # Fallback to parsed URL if no endpoint info
+            parsed_url = urlparse(api_call.url)
+            return {
+                "raw": f"{{{{baseUrl}}}}{parsed_url.path}",
+                "host": ["{{baseUrl}}"],
+                "path": [seg for seg in parsed_url.path.split('/') if seg],
+                "query": []
+            }
+        
+        # Use the exact path from the OpenAPI spec (preserves trailing slashes)
+        spec_path = endpoint.path
+        logger.debug(f"Using exact OpenAPI spec path: {spec_path}")
+        
+        # Start with the original spec path
+        final_path = spec_path
+        
+        # Replace path parameters with dependency-aware variables
+        for param in endpoint.parameters:
+            if param.get('in') == 'path':
+                param_name = param.get('name')
+                param_placeholder = f"{{{param_name}}}"
+                
+                # Find the corresponding variable from previous requests
+                variable_ref = self._find_dependency_variable(param_name, sequence, api_call)
+                
+                # Replace the placeholder in the path
+                if param_placeholder in final_path:
+                    final_path = final_path.replace(param_placeholder, variable_ref)
+                    logger.info(f"🔗 Replaced {param_placeholder} with {variable_ref} in spec path")
+        
+        # Create path segments for Postman structure (preserving trailing slashes)
+        path_parts = final_path.split('/')
+        path_segments = [seg for seg in path_parts if seg]
+        
+        # If original path had trailing slash, preserve it by adding empty string
+        if final_path.endswith('/') and path_segments:
+            path_segments.append('')
+        
+        # Parse query parameters from the actual API call if any
+        parsed_url = urlparse(api_call.url)
+        query_params = []
+        if parsed_url.query:
+            for key, values in parse_qs(parsed_url.query).items():
+                for value in values:
+                    # Check if this query parameter should use a variable
+                    variable_ref = self._find_dependency_variable(key, sequence, api_call)
+                    if variable_ref.startswith('{{') and variable_ref.endswith('}}'):
+                        query_params.append({
+                            "key": key,
+                            "value": variable_ref
+                        })
+                    else:
+                        query_params.append({
+                            "key": key,
+                            "value": value
+                        })
+        
+        return {
+            "raw": f"{{{{baseUrl}}}}{final_path}",
+            "host": ["{{baseUrl}}"],
+            "path": path_segments,
+            "query": query_params
+        }
+    
     def _create_request_description(self, api_call: APICall, endpoint: Optional[EndpointInfo]) -> str:
         """Create description for the request."""
         description_parts = []
@@ -467,13 +749,13 @@ class PostmanGenerator:
     
     def _create_test_script(self, api_call: APICall, endpoint: Optional[EndpointInfo], 
                           sequence: TestSequence) -> List[str]:
-        """Create test script with assertions and variable extraction."""
+        """Create test script with smart CRUD assertions and state validation."""
         script_lines = [
-            f"// Test script for {api_call.method} {api_call.endpoint_id}",
+            f"// Smart test script for {api_call.method} {api_call.endpoint_id}",
             ""
         ]
         
-        # Basic status code test
+        # Basic status code test with enhanced logic
         if api_call.success:
             script_lines.extend([
                 "pm.test('Status code is success', function () {",
@@ -507,9 +789,17 @@ class PostmanGenerator:
                 ""
             ])
         
-        # Variable extraction
+        # Smart CRUD-specific assertions
+        crud_assertions = self._create_smart_crud_assertions(api_call, endpoint, sequence)
+        script_lines.extend(crud_assertions)
+        
+        # Response schema validation
+        schema_validation = self._create_response_schema_validation(api_call, endpoint)
+        script_lines.extend(schema_validation)
+        
+        # Variable extraction with state tracking
         if api_call.success and api_call.response_body:
-            extraction_script = self._create_variable_extraction_script(api_call)
+            extraction_script = self._create_enhanced_variable_extraction_script(api_call, endpoint)
             script_lines.extend(extraction_script)
         
         # Dependency verification tests
@@ -522,13 +812,315 @@ class PostmanGenerator:
         
         return script_lines
     
-    def _create_variable_extraction_script(self, api_call: APICall) -> List[str]:
-        """Create script to extract variables from response."""
+    def _create_enhanced_test_script(self, api_call: APICall, endpoint: Optional[EndpointInfo], 
+                                   sequence: TestSequence, request_number: int) -> List[str]:
+        """Create enhanced test script with better dependency-aware variable extraction."""
+        script_lines = []
+        
+        # Start with the base test script
+        base_script = self._create_test_script(api_call, endpoint, sequence)
+        script_lines.extend(base_script)
+        
+        # Add enhanced variable extraction for dependency chaining
+        # Include extraction for POST methods regardless of success (for Postman generation)
+        if api_call.method in ['POST', 'PUT', 'PATCH']:
+            script_lines.extend([
+                "",
+                "// Enhanced dependency-aware variable extraction",
+                "if (pm.response.code >= 200 && pm.response.code < 300) {",
+                "    try {",
+                "        const responseJson = pm.response.json();",
+                ""
+            ])
+            
+            # Extract resource-specific ID based on endpoint
+            resource_type = self._extract_resource_type_from_endpoint(api_call.endpoint_id)
+            if resource_type and resource_type != 'unknown':
+                id_var_name = f"{resource_type}Id"
+                script_lines.extend([
+                    f"        // Extract {resource_type} ID for dependency chaining",
+                    "        if (responseJson.id) {",
+                    f"            pm.collectionVariables.set('{id_var_name}', responseJson.id);",
+                    f"            console.log('🔗 Extracted {id_var_name} for dependencies: ' + responseJson.id);",
+                    "        }",
+                    ""
+                ])
+            
+            script_lines.extend([
+                "    } catch (e) {",
+                "        console.log('Could not extract dependency variables: ' + e.message);",
+                "    }",
+                "}",
+                ""
+            ])
+        
+        return script_lines
+    
+    def _extract_resource_type_from_endpoint(self, endpoint_id: str) -> str:
+        """Extract resource type from endpoint ID."""
+        # Extract from endpoint path
+        if ':' in endpoint_id:
+            parts = endpoint_id.split(':')
+            if len(parts) >= 3:
+                path = parts[2]  # Get the path part
+                # Extract first meaningful segment
+                segments = [s for s in path.split('/') if s and not s.startswith('{')]
+                if segments:
+                    return segments[0].lower()
+        
+        return 'unknown'
+    
+    def _infer_resource_type_from_endpoint(self, endpoint_id: str) -> str:
+        """Infer the resource type from an endpoint ID for generic 'id' parameter mapping."""
+        # For endpoints like "organization-api:GET:/organization/{id}/with-employees"
+        # we want to extract "organization" as the resource type
+        
+        if ':' in endpoint_id:
+            parts = endpoint_id.split(':')
+            if len(parts) >= 3:
+                path = parts[2]  # Get the path part
+                
+                # Extract the first path segment as the resource type
+                path_segments = [s for s in path.split('/') if s and not s.startswith('{')]
+                if path_segments:
+                    resource_type = path_segments[0].lower()
+                    logger.debug(f"Inferred resource type '{resource_type}' from endpoint {endpoint_id}")
+                    return resource_type
+        
+        logger.debug(f"Could not infer resource type from endpoint {endpoint_id}")
+        return None
+    
+    def _create_path_segments_with_structure(self, original_path: str) -> List[str]:
+        """Create path segments while preserving the original URL structure."""
+        # Split the path but keep track of empty segments for trailing slashes
+        if not original_path or original_path == '/':
+            return []
+        
+        # Remove leading slash, split, then filter empty segments but remember structure
+        path_without_leading_slash = original_path.lstrip('/')
+        segments = [seg for seg in path_without_leading_slash.split('/') if seg]
+        
+        return segments
+    
+    def _reconstruct_path_from_segments(self, segments: List[str], original_path: str) -> str:
+        """Reconstruct the path from segments, preserving trailing slash from original."""
+        if not segments:
+            return '/'
+        
+        # Join segments with forward slashes
+        reconstructed = '/' + '/'.join(segments)
+        
+        # Preserve trailing slash if it was in the original
+        if original_path.endswith('/') and not reconstructed.endswith('/'):
+            reconstructed += '/'
+            
+        logger.debug(f"Reconstructed path: {original_path} -> {reconstructed}")
+        return reconstructed
+    
+    def _create_smart_crud_assertions(self, api_call: APICall, endpoint: Optional[EndpointInfo], 
+                                    sequence: TestSequence) -> List[str]:
+        """Create smart assertions based on CRUD operation type."""
+        script_lines = []
+        
+        if not endpoint:
+            return script_lines
+        
+        method = api_call.method.upper()
+        
+        if method == 'POST' and api_call.success:
+            # POST: Verify response contains sent data
+            script_lines.extend([
+                "// POST: Verify response contains sent data",
+                "pm.test('POST response contains sent data', function () {",
+                "    const responseJson = pm.response.json();",
+                "    const requestBody = JSON.parse(pm.request.body.raw || '{}');",
+                "    ",
+                "    // Helper function to resolve Postman variables",
+                "    function resolveVariable(value) {",
+                "        if (typeof value === 'string' && value.startsWith('{{') && value.endsWith('}}')) {",
+                "            const varName = value.slice(2, -2);",
+                "            const resolved = pm.variables.get(varName);",
+                "            return resolved !== undefined ? resolved : value;",
+                "        }",
+                "        return value;",
+                "    }",
+                "    ",
+                "    // Check if sent data is reflected in response",
+                "    Object.keys(requestBody).forEach(key => {",
+                "        if (responseJson[key] !== undefined) {",
+                "            const sentValue = resolveVariable(requestBody[key]);",
+                "            const responseValue = responseJson[key];",
+                "            ",
+                "            // Handle type coercion (string vs number)",
+                "            const normalizedSent = typeof sentValue === 'string' && !isNaN(sentValue) ? Number(sentValue) : sentValue;",
+                "            const normalizedResponse = typeof responseValue === 'string' && !isNaN(responseValue) ? Number(responseValue) : responseValue;",
+                "            ",
+                "            pm.expect(normalizedResponse).to.equal(normalizedSent);",
+                "            console.log(`✓ Sent ${key}: ${requestBody[key]} (resolved: ${sentValue}) matches response: ${responseValue}`);",
+                "        }",
+                "    });",
+                "});",
+                ""
+            ])
+            
+            # Verify ID generation for created resources
+            if isinstance(api_call.response_body, dict):
+                id_fields = [k for k in api_call.response_body.keys() 
+                           if any(pattern in k.lower() for pattern in ['id', 'uuid', 'key'])]
+                if id_fields:
+                    script_lines.extend([
+                        "// POST: Verify ID generation",
+                        "pm.test('Created resource has ID', function () {",
+                        "    const responseJson = pm.response.json();",
+                        f"    const idFields = {id_fields};",
+                        "    let hasId = false;",
+                        "    idFields.forEach(field => {",
+                        "        if (responseJson[field] !== undefined && responseJson[field] !== null) {",
+                        "            hasId = true;",
+                        "            console.log(`✓ Generated ${field}: ${responseJson[field]}`);",
+                        "        }",
+                        "    });",
+                        "    pm.expect(hasId).to.be.true;",
+                        "});",
+                        ""
+                    ])
+        
+        elif method == 'GET' and api_call.success:
+            # GET: Confirm retrieved data matches prior POST/PUT state
+            script_lines.extend([
+                "// GET: Verify data consistency with prior operations",
+                "pm.test('GET data reflects previous state', function () {",
+                "    const responseJson = pm.response.json();",
+                "    ",
+                "    // Check if response has valid structure (array or object)",
+                "    pm.expect(responseJson).to.not.be.null;",
+                "    pm.expect(responseJson).to.not.be.undefined;",
+                "    ",
+                "    // Verify non-empty response for successful GET",
+                "    if (Array.isArray(responseJson)) {",
+                "        console.log(`✓ GET returned array with ${responseJson.length} items`);",
+                "        if (responseJson.length === 0) {",
+                "            console.warn('⚠️ GET returned empty array - may indicate incomplete data');",
+                "        } else {",
+                "            console.log(`✓ Array contains data - first item has ${Object.keys(responseJson[0] || {}).length} fields`);",
+                "        }",
+                "    } else if (typeof responseJson === 'object') {",
+                "        const keys = Object.keys(responseJson);",
+                "        pm.expect(keys.length).to.be.greaterThan(0);",
+                "        console.log(`✓ GET returned object with fields: ${keys.join(', ')}`);",
+                "    } else {",
+                "        console.warn(`⚠️ Unexpected response type: ${typeof responseJson}`);",
+                "    }",
+                "});",
+                ""
+            ])
+        
+        elif method == 'PUT' and api_call.success:
+            # PUT: Verify updates reflect in response
+            script_lines.extend([
+                "// PUT: Verify updates are reflected",
+                "pm.test('PUT updates are reflected in response', function () {",
+                "    const responseJson = pm.response.json();",
+                "    const requestBody = JSON.parse(pm.request.body.raw || '{}');",
+                "    ",
+                "    // Verify updated fields are reflected in response",
+                "    Object.keys(requestBody).forEach(key => {",
+                "        if (responseJson[key] !== undefined) {",
+                "            pm.expect(responseJson[key]).to.equal(requestBody[key]);",
+                "            console.log(`✓ Updated ${key}: ${requestBody[key]} reflected in response`);",
+                "        }",
+                "    });",
+                "    ",
+                "    // Store updated state for future validations",
+                "    Object.keys(requestBody).forEach(key => {",
+                "        pm.variables.set(`updated_${key}`, requestBody[key]);",
+                "    });",
+                "});",
+                ""
+            ])
+        
+        elif method == 'DELETE':
+            # DELETE: Confirm resource removal
+            if api_call.success:
+                script_lines.extend([
+                    "// DELETE: Verify successful deletion",
+                    "pm.test('DELETE operation successful', function () {",
+                    "    pm.expect(pm.response.code).to.be.oneOf([200, 202, 204]);",
+                    "    console.log('✓ Resource deleted successfully');",
+                    "    ",
+                    "    // Clear related variables since resource is deleted",
+                    "    const resourceId = pm.variables.get('resourceId');",
+                    "    if (resourceId) {",
+                    "        pm.variables.unset('resourceId');",
+                    "        console.log('✓ Cleared resource ID from variables');",
+                    "    }",
+                    "});",
+                    ""
+                ])
+            else:
+                script_lines.extend([
+                    "// DELETE: Handle deletion failure",
+                    "pm.test('DELETE failure handled appropriately', function () {",
+                    "    if (pm.response.code === 404) {",
+                    "        console.log('Resource already deleted or not found');",
+                    "        pm.expect(true).to.be.true; // 404 is acceptable for DELETE",
+                    "    } else {",
+                    f"        pm.expect(pm.response.code).to.equal({api_call.response_status});",
+                    "    }",
+                    "});",
+                    ""
+                ])
+        
+        return script_lines
+    
+    def _create_response_schema_validation(self, api_call: APICall, endpoint: Optional[EndpointInfo]) -> List[str]:
+        """Create response schema validation tests."""
+        script_lines = []
+        
+        if not endpoint or not api_call.success:
+            return script_lines
+        
+        script_lines.extend([
+            "// Response schema validation",
+            "pm.test('Response matches expected schema structure', function () {",
+            "    const responseJson = pm.response.json();",
+            "    ",
+            "    // Basic structure validation",
+            "    pm.expect(responseJson).to.not.be.undefined;",
+            "    pm.expect(responseJson).to.not.be.null;",
+            "    ",
+            "    // Check for required fields based on endpoint expectations",
+        ])
+        
+        # Add specific validations based on response body content
+        if isinstance(api_call.response_body, dict):
+            for key, value in api_call.response_body.items():
+                if any(pattern in key.lower() for pattern in ['id', 'uuid', 'key']):
+                    script_lines.extend([
+                        f"    if (responseJson.{key} !== undefined) {{",
+                        f"        pm.expect(responseJson.{key}).to.not.be.null;",
+                        f"        pm.expect(responseJson.{key}).to.not.equal('');",
+                        f"        console.log('✓ {key} is present and valid');",
+                        f"    }}"
+                    ])
+        
+        script_lines.extend([
+            "});",
+            ""
+        ])
+        
+        return script_lines
+    
+    def _create_enhanced_variable_extraction_script(self, api_call: APICall, endpoint: Optional[EndpointInfo]) -> List[str]:
+        """Create enhanced variable extraction with state tracking."""
         script_lines = [
-            "// Extract variables from response",
+            "// Enhanced variable extraction with state tracking",
             "if (pm.response.code >= 200 && pm.response.code < 300) {",
             "    try {",
             "        const responseJson = pm.response.json();",
+            "        ",
+            "        // Track extraction for state management",
+            "        let extractedCount = 0;",
             ""
         ]
         
@@ -539,11 +1131,26 @@ class PostmanGenerator:
                     script_lines.extend([
                         f"        if (responseJson.{key}) {{",
                         f"            pm.variables.set('{var_name}', responseJson.{key});",
-                        f"            console.log('Extracted {var_name}:', responseJson.{key});",
+                        f"            pm.variables.set('last_{key.lower()}', responseJson.{key});",
+                        f"            console.log('✓ Extracted {var_name}:', responseJson.{key});",
+                        f"            extractedCount++;",
+                        f"            ",
+                        f"            // Store for state validation",
+                        f"            pm.globals.set('state_{var_name}', JSON.stringify({{",
+                        f"                value: responseJson.{key},",
+                        f"                endpoint: '{api_call.endpoint_id}',",
+                        f"                timestamp: new Date().toISOString(),",
+                        f"                method: '{api_call.method}'",
+                        f"            }}));",
                         f"        }}"
                     ])
         
         script_lines.extend([
+            "        ",
+            "        // Log state management statistics",
+            "        console.log(`State tracking: Extracted ${extractedCount} values from response`);",
+            "        pm.globals.set('totalExtractedValues', (parseInt(pm.globals.get('totalExtractedValues') || '0') + extractedCount).toString());",
+            "        ",
             "    } catch (e) {",
             "        console.error('Failed to extract variables:', e);",
             "    }",

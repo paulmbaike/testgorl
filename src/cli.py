@@ -113,10 +113,19 @@ def cli(ctx, verbose):
 @click.option('--collection-name', default='RL Generated API Tests', help='Name for Postman collection')
 @click.option('--export-graph', is_flag=True, help='Export dependency graph to DOT file')
 @click.option('--interactive', is_flag=True, help='Enable interactive mode with user feedback')
+@click.option('--enable-response-validation', is_flag=True, help='Enable response validation against schemas')
+@click.option('--error-resolution', is_flag=True, help='Enable automatic error resolution')
+@click.option('--state-management', is_flag=True, help='Enable advanced state management')
+@click.option('--queue-incomplete-sequences', is_flag=True, help='Queue incomplete sequences for re-exploration')
+@click.option('--max-retries', default=3, help='Maximum retry attempts for error resolution')
+@click.option('--incomplete-threshold', default=0.7, help='Completeness threshold for incomplete responses')
+@click.option('--enable-llm', is_flag=True, help='Enable LLM integration for enhanced analysis (slower but smarter)')
 @click.pass_context
 def generate(ctx, spec_sources, output, base_url, training_steps, num_sequences, 
-             max_sequence_length, collection_name, export_graph, interactive):
-    """Generate API test suite from OpenAPI specifications."""
+             max_sequence_length, collection_name, export_graph, interactive,
+             enable_response_validation, error_resolution, state_management,
+             queue_incomplete_sequences, max_retries, incomplete_threshold, enable_llm):
+    """Generate API test suite from OpenAPI specifications with advanced validation and error resolution."""
     
     print_banner()
     
@@ -458,6 +467,476 @@ def analyze(ctx, spec_sources, output, graph_output):
 
 
 @cli.command()
+@click.argument('spec_sources', nargs=-1, required=True)
+@click.option('--output', '-o', default='response_validation_analysis.json', help='Output validation analysis file')
+@click.option('--base-url', default='http://localhost:8060', help='Base URL for API services')
+@click.option('--sample-size', default=10, help='Number of sample requests per endpoint')
+@click.pass_context
+def validate_responses(ctx, spec_sources, output, base_url, sample_size):
+    """Validate API responses against OpenAPI schemas to detect incomplete data."""
+    
+    print_banner()
+    print_section("✅ Response Validation Analysis")
+    
+    try:
+        # Parse specifications
+        parser = SpecParser()
+        specs = parser.parse_specs(spec_sources)
+        
+        if not specs:
+            print_error("No valid specifications found.")
+            sys.exit(1)
+        
+        print_success(f"Parsed {len(specs)} service specification(s)")
+        
+        # Analyze response completeness patterns
+        analyzer = DependencyAnalyzer()
+        analyzer.analyze_dependencies(specs)
+        
+        completeness_patterns = analyzer.analyze_response_completeness_patterns(specs)
+        
+        print_info(f"Found {len(completeness_patterns['endpoints_expecting_arrays'])} endpoints expecting arrays")
+        print_info(f"Found {len(completeness_patterns['endpoints_expecting_objects'])} endpoints expecting objects")
+        print_info(f"Found {len(completeness_patterns['endpoints_with_required_fields'])} endpoints with required fields")
+        
+        # Test a few endpoints to demonstrate validation
+        print_section("🧪 Sample Response Validation")
+        validation_results = []
+        
+        for spec in specs[:2]:  # Test first 2 services
+            for endpoint in spec.endpoints[:3]:  # Test first 3 endpoints per service
+                print_info(f"Testing {endpoint.method} {endpoint.path}")
+                
+                # Create mock responses to demonstrate validation
+                mock_responses = [
+                    {},  # Empty object
+                    [],  # Empty array
+                    {"id": 123, "name": "Test"},  # Partial data
+                    None  # Null response
+                ]
+                
+                for i, mock_response in enumerate(mock_responses):
+                    validation = parser.validate_response_against_schema(endpoint, mock_response, 200)
+                    validation_results.append({
+                        'endpoint_id': endpoint.endpoint_id,
+                        'mock_response_type': f"mock_{i}",
+                        'validation_result': validation
+                    })
+                    
+                    completeness = validation['completeness_score']
+                    if completeness < 0.7:
+                        print_warning(f"  Mock response {i}: Incomplete (score: {completeness:.2f})")
+                    else:
+                        print_success(f"  Mock response {i}: Complete (score: {completeness:.2f})")
+        
+        # Save validation analysis
+        validation_report = {
+            'completeness_patterns': completeness_patterns,
+            'sample_validations': validation_results,
+            'summary': {
+                'total_endpoints_analyzed': sum(len(spec.endpoints) for spec in specs),
+                'endpoints_expecting_arrays': len(completeness_patterns['endpoints_expecting_arrays']),
+                'endpoints_expecting_objects': len(completeness_patterns['endpoints_expecting_objects']),
+                'critical_field_mappings': len(completeness_patterns['critical_field_mappings'])
+            }
+        }
+        
+        with open(output, 'w') as f:
+            json.dump(validation_report, f, indent=2)
+        
+        print_success(f"Response validation analysis saved to {output}")
+        
+    except Exception as e:
+        print_error(f"Response validation analysis failed: {e}")
+        if ctx.obj.get('verbose'):
+            import traceback
+            traceback.print_exc()
+        sys.exit(1)
+
+
+@cli.command()
+@click.argument('collection_file')
+@click.option('--show-incomplete', is_flag=True, help='Show incomplete sequences')
+@click.option('--show-resolved-errors', is_flag=True, help='Show resolved error statistics')
+@click.option('--show-state-summary', is_flag=True, help='Show state management summary')
+def review(collection_file, show_incomplete, show_resolved_errors, show_state_summary):
+    """Review generated collections with detailed analysis of incomplete sequences and error resolution."""
+    
+    print_section("🔍 Collection Review and Analysis")
+    
+    try:
+        with open(collection_file, 'r') as f:
+            collection = json.load(f)
+        
+        # Basic validation
+        required_fields = ['info', 'item']
+        missing_fields = [field for field in required_fields if field not in collection]
+        
+        if missing_fields:
+            print_error(f"Missing required fields: {missing_fields}")
+            sys.exit(1)
+        
+        # Count items and analyze structure
+        total_requests = 0
+        total_folders = len(collection['item'])
+        incomplete_sequences = []
+        resolved_errors = []
+        state_variables = []
+        
+        for item in collection['item']:
+            if 'item' in item:  # It's a folder
+                folder_requests = item['item']
+                total_requests += len(folder_requests)
+                
+                # Analyze folder for incomplete sequences and resolved errors
+                for request in folder_requests:
+                    request_name = request.get('name', '')
+                    
+                    # Check for incomplete response indicators
+                    if any(indicator in request_name.lower() for indicator in ['empty', 'incomplete', 'missing']):
+                        incomplete_sequences.append({
+                            'folder': item.get('name', 'Unknown'),
+                            'request': request_name,
+                            'endpoint': request.get('request', {}).get('url', {}).get('raw', 'Unknown')
+                        })
+                    
+                    # Check for error resolution indicators
+                    events = request.get('event', [])
+                    for event in events:
+                        if event.get('listen') == 'test':
+                            script_exec = event.get('script', {}).get('exec', [])
+                            script_text = ' '.join(script_exec)
+                            if 'error resolution' in script_text.lower() or 'resolved' in script_text.lower():
+                                resolved_errors.append({
+                                    'folder': item.get('name', 'Unknown'),
+                                    'request': request_name
+                                })
+                    
+                    # Check for state variables
+                    if 'state_' in str(request):
+                        state_variables.append(request_name)
+            else:  # It's a request
+                total_requests += 1
+        
+        print_success("Collection validation passed")
+        print(f"  • Collection name: {collection['info']['name']}")
+        print(f"  • Folders: {total_folders}")
+        print(f"  • Total requests: {total_requests}")
+        print(f"  • Variables: {len(collection.get('variable', []))}")
+        
+        # Show detailed analysis if requested
+        if show_incomplete:
+            print_section("⚠️ Incomplete Sequences Analysis")
+            if incomplete_sequences:
+                print(f"Found {len(incomplete_sequences)} potentially incomplete sequences:")
+                for seq in incomplete_sequences:
+                    print(f"  • {seq['folder']} → {seq['request']}")
+                    print(f"    Endpoint: {seq['endpoint']}")
+            else:
+                print_success("No incomplete sequences detected")
+        
+        if show_resolved_errors:
+            print_section("🔧 Error Resolution Statistics")
+            if resolved_errors:
+                print(f"Found {len(resolved_errors)} resolved errors:")
+                for error in resolved_errors:
+                    print(f"  • {error['folder']} → {error['request']}")
+            else:
+                print_info("No resolved errors found in collection")
+        
+        if show_state_summary:
+            print_section("💾 State Management Summary")
+            print(f"State-aware requests: {len(state_variables)}")
+            print(f"Global variables: {len(collection.get('variable', []))}")
+            
+            # Analyze variable types
+            variables = collection.get('variable', [])
+            id_vars = [v for v in variables if any(pattern in v.get('key', '').lower() for pattern in ['id', 'uuid', 'key'])]
+            auth_vars = [v for v in variables if 'auth' in v.get('key', '').lower() or 'token' in v.get('key', '').lower()]
+            
+            print(f"  • ID/Key variables: {len(id_vars)}")
+            print(f"  • Auth variables: {len(auth_vars)}")
+            print(f"  • Other variables: {len(variables) - len(id_vars) - len(auth_vars)}")
+        
+    except FileNotFoundError:
+        print_error(f"Collection file not found: {collection_file}")
+        sys.exit(1)
+    except json.JSONDecodeError as e:
+        print_error(f"Invalid JSON in collection file: {e}")
+        sys.exit(1)
+    except Exception as e:
+        print_error(f"Review failed: {e}")
+        sys.exit(1)
+
+
+@cli.command()
+@click.argument('spec_sources', nargs=-1, required=True)
+@click.option('--base-url', default='http://localhost:8060', help='Base URL for API services')
+@click.option('--max-errors', default=5, help='Maximum errors to analyze per endpoint')
+@click.option('--output', '-o', default='error_analysis.json', help='Output error analysis file')
+@click.pass_context
+def analyze_errors(ctx, spec_sources, base_url, max_errors, output):
+    """Analyze API error patterns and suggest dependency resolution strategies."""
+    
+    print_banner()
+    print_section("🔧 Error Analysis and Resolution")
+    
+    try:
+        # Parse specifications
+        parser = SpecParser()
+        specs = parser.parse_specs(spec_sources)
+        
+        if not specs:
+            print_error("No valid specifications found.")
+            sys.exit(1)
+        
+        print_success(f"Parsed {len(specs)} service specification(s)")
+        
+        # Analyze dependencies
+        analyzer = DependencyAnalyzer()
+        analyzer.analyze_dependencies(specs)
+        
+        # Simulate error analysis (in real usage, this would use actual API calls)
+        print_info("Analyzing potential error patterns...")
+        
+        error_patterns = []
+        resolution_strategies = []
+        
+        for spec in specs:
+            for endpoint in spec.endpoints:
+                # Identify potential error scenarios
+                critical_fields = parser.identify_critical_fields(endpoint)
+                
+                if critical_fields['required_fields']:
+                    error_patterns.append({
+                        'endpoint_id': endpoint.endpoint_id,
+                        'potential_errors': [
+                            f"Missing required field: {field}" for field in critical_fields['required_fields']
+                        ],
+                        'critical_fields': critical_fields
+                    })
+                
+                # Suggest resolution strategies
+                if critical_fields['id_fields']:
+                    for id_field in critical_fields['id_fields']:
+                        # Find potential producers for this ID
+                        potential_producers = []
+                        for other_spec in specs:
+                            for other_endpoint in other_spec.endpoints:
+                                if (other_endpoint.method in ['POST', 'PUT'] and 
+                                    other_endpoint.endpoint_id != endpoint.endpoint_id):
+                                    other_fields = parser.extract_dependency_fields(other_endpoint)
+                                    if any(id_field.lower() in field.lower() for field in other_fields['response_body_fields']):
+                                        potential_producers.append(other_endpoint.endpoint_id)
+                        
+                        if potential_producers:
+                            resolution_strategies.append({
+                                'missing_field': id_field,
+                                'consumer_endpoint': endpoint.endpoint_id,
+                                'potential_producers': potential_producers,
+                                'resolution_confidence': 0.8
+                            })
+        
+        # Generate error analysis report
+        error_report = {
+            'error_patterns': error_patterns,
+            'resolution_strategies': resolution_strategies,
+            'summary': {
+                'total_potential_errors': len(error_patterns),
+                'resolvable_errors': len(resolution_strategies),
+                'resolution_coverage': len(resolution_strategies) / max(len(error_patterns), 1)
+            }
+        }
+        
+        with open(output, 'w') as f:
+            json.dump(error_report, f, indent=2)
+        
+        print_success(f"Error analysis report saved to {output}")
+        
+        # Display summary
+        print_section("📊 Error Analysis Summary")
+        print(f"Potential error patterns: {len(error_patterns)}")
+        print(f"Resolvable errors: {len(resolution_strategies)}")
+        print(f"Resolution coverage: {error_report['summary']['resolution_coverage']:.1%}")
+        
+        if resolution_strategies:
+            print("\nTop resolution strategies:")
+            for i, strategy in enumerate(resolution_strategies[:5], 1):
+                print(f"  {i}. {strategy['missing_field']} for {strategy['consumer_endpoint']}")
+                print(f"     Producers: {', '.join(strategy['potential_producers'][:3])}")
+        
+    except Exception as e:
+        print_error(f"Error analysis failed: {e}")
+        if ctx.obj.get('verbose'):
+            import traceback
+            traceback.print_exc()
+        sys.exit(1)
+
+
+@cli.command()
+@click.argument('collection_file')
+@click.option('--incomplete-threshold', default=0.7, help='Completeness threshold for incomplete sequences')
+@click.option('--show-details', is_flag=True, help='Show detailed information')
+def review_incomplete(collection_file, incomplete_threshold, show_details):
+    """Review incomplete sequences and suggest resolution strategies."""
+    
+    print_section("⚠️ Incomplete Sequences Review")
+    
+    try:
+        with open(collection_file, 'r') as f:
+            collection = json.load(f)
+        
+        incomplete_found = []
+        
+        # Analyze collection for incomplete sequence indicators
+        for item in collection['item']:
+            if 'item' in item:  # It's a folder (sequence)
+                folder_name = item.get('name', '')
+                folder_requests = item['item']
+                
+                # Look for incomplete indicators in folder description
+                description = item.get('description', '').lower()
+                if any(indicator in description for indicator in ['incomplete', 'empty', 'missing', 'validation']):
+                    incomplete_info = {
+                        'folder_name': folder_name,
+                        'request_count': len(folder_requests),
+                        'description': item.get('description', ''),
+                        'incomplete_indicators': []
+                    }
+                    
+                    # Analyze individual requests
+                    for request in folder_requests:
+                        request_name = request.get('name', '')
+                        events = request.get('event', [])
+                        
+                        for event in events:
+                            if event.get('listen') == 'test':
+                                script_exec = event.get('script', {}).get('exec', [])
+                                script_text = ' '.join(script_exec).lower()
+                                
+                                if 'empty' in script_text or 'incomplete' in script_text:
+                                    incomplete_info['incomplete_indicators'].append({
+                                        'request': request_name,
+                                        'type': 'empty_response'
+                                    })
+                                elif 'missing' in script_text:
+                                    incomplete_info['incomplete_indicators'].append({
+                                        'request': request_name,
+                                        'type': 'missing_fields'
+                                    })
+                    
+                    if incomplete_info['incomplete_indicators']:
+                        incomplete_found.append(incomplete_info)
+        
+        if incomplete_found:
+            print_warning(f"Found {len(incomplete_found)} sequences with incomplete responses")
+            
+            for seq in incomplete_found:
+                print(f"\n📁 {seq['folder_name']} ({seq['request_count']} requests)")
+                if show_details:
+                    print(f"   Description: {seq['description'][:100]}...")
+                    for indicator in seq['incomplete_indicators']:
+                        print(f"   ⚠️ {indicator['request']}: {indicator['type']}")
+                
+                # Suggest resolution strategies
+                print("   💡 Suggested actions:")
+                print("     1. Check if prerequisite endpoints need to be called first")
+                print("     2. Verify authentication and permissions")
+                print("     3. Review dependency chain for missing data")
+                print("     4. Consider if endpoint requires specific test data")
+        else:
+            print_success("No incomplete sequences found in collection")
+        
+    except FileNotFoundError:
+        print_error(f"Collection file not found: {collection_file}")
+        sys.exit(1)
+    except json.JSONDecodeError as e:
+        print_error(f"Invalid JSON in collection file: {e}")
+        sys.exit(1)
+    except Exception as e:
+        print_error(f"Review failed: {e}")
+        sys.exit(1)
+
+
+@cli.command()
+@click.argument('log_file', default='api_test_generator.log')
+@click.option('--error-types', multiple=True, help='Filter by error types')
+@click.option('--show-resolutions', is_flag=True, help='Show successful error resolutions')
+@click.option('--export-summary', help='Export summary to JSON file')
+def analyze_logs(log_file, error_types, show_resolutions, export_summary):
+    """Analyze logs to review error resolution performance and incomplete sequence handling."""
+    
+    print_section("📊 Log Analysis - Error Resolution Performance")
+    
+    try:
+        if not Path(log_file).exists():
+            print_error(f"Log file not found: {log_file}")
+            sys.exit(1)
+        
+        with open(log_file, 'r') as f:
+            log_content = f.read()
+        
+        # Parse log for error resolution patterns
+        lines = log_content.split('\n')
+        
+        error_resolutions = []
+        incomplete_sequences = []
+        dependency_verifications = []
+        
+        for line in lines:
+            line_lower = line.lower()
+            
+            # Look for error resolution patterns
+            if 'successfully resolved error' in line_lower:
+                error_resolutions.append(line.strip())
+            elif 'marked incomplete response' in line_lower:
+                incomplete_sequences.append(line.strip())
+            elif 'dependency verified' in line_lower:
+                dependency_verifications.append(line.strip())
+        
+        print_success(f"Analyzed log file: {log_file}")
+        print(f"  • Error resolutions: {len(error_resolutions)}")
+        print(f"  • Incomplete sequences: {len(incomplete_sequences)}")
+        print(f"  • Dependency verifications: {len(dependency_verifications)}")
+        
+        if show_resolutions and error_resolutions:
+            print_section("🔧 Successful Error Resolutions")
+            for i, resolution in enumerate(error_resolutions[:10], 1):
+                print(f"  {i}. {resolution}")
+        
+        if incomplete_sequences:
+            print_section("⚠️ Incomplete Sequences Detected")
+            print(f"Found {len(incomplete_sequences)} incomplete responses")
+            if show_resolutions:
+                for i, seq in enumerate(incomplete_sequences[:5], 1):
+                    print(f"  {i}. {seq}")
+        
+        # Export summary if requested
+        if export_summary:
+            summary = {
+                'log_file': log_file,
+                'analysis_timestamp': time.time(),
+                'statistics': {
+                    'error_resolutions': len(error_resolutions),
+                    'incomplete_sequences': len(incomplete_sequences),
+                    'dependency_verifications': len(dependency_verifications)
+                },
+                'error_resolution_details': error_resolutions,
+                'incomplete_sequence_details': incomplete_sequences,
+                'dependency_verification_details': dependency_verifications
+            }
+            
+            with open(export_summary, 'w') as f:
+                json.dump(summary, f, indent=2)
+            
+            print_success(f"Log analysis summary exported to {export_summary}")
+        
+    except Exception as e:
+        print_error(f"Log analysis failed: {e}")
+        sys.exit(1)
+
+
+@cli.command()
 @click.argument('collection_file')
 def validate(collection_file):
     """Validate a generated Postman collection."""
@@ -505,44 +984,95 @@ def validate(collection_file):
 
 @cli.command()
 def examples():
-    """Show usage examples."""
+    """Show usage examples with new response validation and error resolution features."""
     
     print_banner()
-    print_section("📚 Usage Examples")
+    print_section("📚 Usage Examples - Updated System")
     
     examples_text = f"""
-{Fore.CYAN}1. Generate test suite from local OpenAPI specs:{Style.RESET_ALL}
-   python -m src.cli generate spec1.yaml spec2.json --output my_tests.json
+{Fore.CYAN}1. Generate test suite with response validation:{Style.RESET_ALL}
+   python main.py generate spec1.yaml spec2.json \\
+     --output my_tests.json \\
+     --enable-response-validation \\
+     --error-resolution
 
-{Fore.CYAN}2. Generate from remote URLs:{Style.RESET_ALL}
-   python -m src.cli generate \\
+{Fore.CYAN}2. Generate with comprehensive error analysis:{Style.RESET_ALL}
+   python main.py generate \\
      http://localhost:8060/employee/v3/api-docs \\
      http://localhost:8060/department/v3/api-docs \\
      --base-url http://localhost:8060 \\
-     --training-steps 20000
+     --training-steps 20000 \\
+     --max-retries 3 \\
+     --state-management
 
-{Fore.CYAN}3. Interactive mode with custom parameters:{Style.RESET_ALL}
-   python -m src.cli generate specs/*.yaml \\
+{Fore.CYAN}3. Interactive mode with new features:{Style.RESET_ALL}
+   python main.py generate specs/*.yaml \\
      --interactive \\
      --num-sequences 10 \\
      --max-sequence-length 30 \\
-     --collection-name "My API Test Suite"
+     --collection-name "Smart API Test Suite" \\
+     --queue-incomplete-sequences
 
-{Fore.CYAN}4. Analyze dependencies only:{Style.RESET_ALL}
-   python -m src.cli analyze spec1.yaml spec2.json \\
-     --output analysis.json \\
-     --graph-output deps.dot
+{Fore.CYAN}4. Validate API responses against schemas:{Style.RESET_ALL}
+   python main.py validate-responses spec1.yaml spec2.json \\
+     --output validation_analysis.json \\
+     --sample-size 20
 
-{Fore.CYAN}5. Validate generated collection:{Style.RESET_ALL}
-   python -m src.cli validate my_tests.json
+{Fore.CYAN}5. Analyze error patterns and resolution strategies:{Style.RESET_ALL}
+   python main.py analyze-errors specs/*.yaml \\
+     --output error_analysis.json \\
+     --max-errors 10
 
-{Fore.CYAN}6. Enable verbose logging:{Style.RESET_ALL}
-   python -m src.cli --verbose generate specs/*.yaml
+{Fore.CYAN}6. Review generated collections for incomplete sequences:{Style.RESET_ALL}
+   python main.py review my_tests.json \\
+     --show-incomplete \\
+     --show-resolved-errors \\
+     --show-state-summary
 
-{Fore.GREEN}Environment Variables:{Style.RESET_ALL}
-   API_BASE_URL     - Default base URL for services
-   AUTH_TOKEN       - Authentication token for secured endpoints
-   TRAINING_STEPS   - Default number of RL training steps
+{Fore.CYAN}7. Review incomplete sequences specifically:{Style.RESET_ALL}
+   python main.py review-incomplete my_tests.json \\
+     --incomplete-threshold 0.8 \\
+     --show-details
+
+{Fore.CYAN}8. Analyze logs for error resolution performance:{Style.RESET_ALL}
+   python main.py analyze-logs api_test_generator.log \\
+     --show-resolutions \\
+     --export-summary log_summary.json
+
+{Fore.CYAN}9. Validate existing collection:{Style.RESET_ALL}
+   python main.py validate my_tests.json
+
+{Fore.CYAN}10. Enable verbose logging with new features:{Style.RESET_ALL}
+    python main.py --verbose generate specs/*.yaml \\
+      --enable-response-validation \\
+      --error-resolution \\
+      --state-management
+
+{Fore.CYAN}11. Enable LLM integration for smarter analysis (slower):{Style.RESET_ALL}
+    python main.py generate specs/*.yaml \\
+      --enable-llm \\
+      --enable-response-validation \\
+      --error-resolution \\
+      --training-steps 5000
+
+{Fore.GREEN}New Environment Variables:{Style.RESET_ALL}
+   API_BASE_URL              - Default base URL for services
+   AUTH_TOKEN                - Authentication token for secured endpoints
+   TRAINING_STEPS            - Default number of RL training steps
+   RESPONSE_VALIDATION       - Enable response validation (true/false)
+   ERROR_RESOLUTION          - Enable error resolution (true/false)
+   STATE_MANAGEMENT          - Enable state management (true/false)
+   INCOMPLETE_THRESHOLD      - Threshold for incomplete responses (0.0-1.0)
+   ENABLE_LLM                - Enable LLM integration (true/false, default: false)
+
+{Fore.YELLOW}Key New Features:{Style.RESET_ALL}
+   • Response validation against OpenAPI schemas
+   • Automatic error resolution (400-500 → 200)
+   • Incomplete sequence queuing and re-exploration
+   • State-aware CRUD assertions
+   • Enhanced dependency detection across all parameter types
+   • Smart test suite generation with human-like logic
+   • Optional LLM integration (disabled by default for performance)
 """
     
     print(examples_text)

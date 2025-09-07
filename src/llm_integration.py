@@ -48,14 +48,16 @@ class LLMSuggestion:
 class LLMDependencyAnalyzer:
     """Uses LLM to enhance dependency hypothesis generation."""
     
-    def __init__(self, model_name: str = "microsoft/DialoGPT-medium"):
+    def __init__(self, model_name: str = "microsoft/DialoGPT-medium", enable_llm: bool = False):
         """
         Initialize LLM analyzer.
         
         Args:
             model_name: HuggingFace model name for dependency analysis
+            enable_llm: Whether to enable LLM features (default: False for performance)
         """
         self.model_name = model_name
+        self.enable_llm = enable_llm
         self.tokenizer = None
         self.model = None
         self.pipeline = None
@@ -82,10 +84,15 @@ class LLMDependencyAnalyzer:
                 'hierarchy', 'nested', 'relationship', 'associated'
             ]
         }
+        
+        if enable_llm:
+            logger.info("LLM integration enabled - will initialize on first use")
+        else:
+            logger.info("LLM integration disabled for better performance")
     
     def _initialize_model(self):
         """Initialize the LLM model and tokenizer."""
-        if self._model_initialized:
+        if self._model_initialized or not self.enable_llm:
             return
         
         try:
@@ -131,10 +138,14 @@ class LLMDependencyAnalyzer:
             base_hypotheses: Existing hypotheses from rule-based analysis
             
         Returns:
-            Enhanced list of hypotheses including LLM suggestions
+            Enhanced list of hypotheses including LLM suggestions (if enabled)
         """
+        if not self.enable_llm:
+            logger.info("LLM enhancement disabled - returning base hypotheses only")
+            return base_hypotheses
+        
         if not self._should_use_llm():
-            logger.info("LLM enhancement disabled or unavailable")
+            logger.info("LLM enhancement skipped due to resource constraints")
             return base_hypotheses
         
         self._initialize_model()
@@ -166,6 +177,332 @@ class LLMDependencyAnalyzer:
         
         logger.info(f"Added {len(enhanced_hypotheses) - len(base_hypotheses)} LLM-enhanced hypotheses")
         return enhanced_hypotheses
+    
+    def analyze_error_for_dependency_resolution(self, error_response: Dict[str, Any], 
+                                              failed_endpoint: Any, 
+                                              available_endpoints: List[Any]) -> Dict[str, Any]:
+        """
+        Analyze error response to suggest dependency resolution strategies.
+        
+        Args:
+            error_response: The error response data
+            failed_endpoint: The endpoint that failed
+            available_endpoints: List of available endpoints that might provide dependencies
+            
+        Returns:
+            Analysis with dependency resolution suggestions
+        """
+        if not self.pipeline:
+            return {'suggestions': [], 'confidence': 0.0, 'reasoning': 'LLM not available'}
+        
+        try:
+            # Create error analysis prompt
+            prompt = self._create_error_analysis_prompt(error_response, failed_endpoint, available_endpoints)
+            
+            # Generate LLM response
+            response = self.pipeline(prompt, max_new_tokens=200, temperature=0.3)[0]['generated_text']
+            generated_text = response[len(prompt):].strip()
+            
+            # Parse suggestions from LLM response
+            suggestions = self._parse_error_resolution_suggestions(generated_text, available_endpoints)
+            
+            return {
+                'suggestions': suggestions,
+                'confidence': self._calculate_error_resolution_confidence(generated_text),
+                'reasoning': generated_text[:300],  # Truncate for storage
+                'llm_analysis': generated_text
+            }
+            
+        except Exception as e:
+            logger.warning(f"Failed to analyze error for dependency resolution: {e}")
+            return {'suggestions': [], 'confidence': 0.0, 'reasoning': f'Analysis failed: {e}'}
+    
+    def _create_error_analysis_prompt(self, error_response: Dict[str, Any], 
+                                    failed_endpoint: Any, available_endpoints: List[Any]) -> str:
+        """Create prompt for error analysis and dependency resolution."""
+        
+        # Extract error information
+        error_message = ""
+        if isinstance(error_response, dict):
+            error_message = (str(error_response.get('message', '')) + ' ' + 
+                           str(error_response.get('error', '')) + ' ' +
+                           str(error_response.get('details', ''))).strip()
+        
+        # Extract endpoint information
+        endpoint_info = f"{failed_endpoint.method} {failed_endpoint.path}"
+        endpoint_desc = failed_endpoint.description or failed_endpoint.summary or "No description"
+        
+        # Build available endpoints summary
+        available_summary = []
+        for ep in available_endpoints[:10]:  # Limit to prevent prompt overflow
+            available_summary.append(f"- {ep.method} {ep.path} ({ep.service_name})")
+        
+        prompt = f"""Analyze this API error to identify missing dependencies:
+
+Failed Request:
+Endpoint: {endpoint_info}
+Service: {failed_endpoint.service_name}
+Description: {endpoint_desc}
+Error Message: {error_message}
+
+Available Endpoints that might provide dependencies:
+{chr(10).join(available_summary)}
+
+Error Analysis Task:
+1. Identify what data/fields are missing based on the error message
+2. Suggest which available endpoints could provide the missing data
+3. Specify the exact field names and data types needed
+4. Recommend the sequence of calls to resolve the dependency
+
+Focus on:
+- ID fields (userId, productId, orderId, etc.)
+- Reference fields (keys, codes, tokens)
+- Required parameters (query params, headers, body fields)
+- Authentication dependencies
+
+Analysis and Suggestions:"""
+        
+        return prompt
+    
+    def _parse_error_resolution_suggestions(self, llm_response: str, available_endpoints: List[Any]) -> List[Dict[str, Any]]:
+        """Parse LLM response to extract actionable dependency resolution suggestions."""
+        suggestions = []
+        
+        response_lower = llm_response.lower()
+        
+        # Extract field names mentioned in the response
+        import re
+        field_patterns = [
+            r'\b(\w+[iI]d)\b',
+            r'\b(\w+[kK]ey)\b',
+            r'\b(\w+[cC]ode)\b',
+            r'\b(\w+[tT]oken)\b',
+            r'\b(\w+[rR]ef)\b'
+        ]
+        
+        mentioned_fields = []
+        for pattern in field_patterns:
+            matches = re.findall(pattern, llm_response)
+            mentioned_fields.extend(matches)
+        
+        # Extract endpoint suggestions
+        endpoint_keywords = []
+        for endpoint in available_endpoints:
+            endpoint_path = endpoint.path.lower()
+            endpoint_method = endpoint.method.lower()
+            
+            # Check if LLM response mentions this endpoint
+            if endpoint_path in response_lower or f"{endpoint_method} {endpoint_path}" in response_lower:
+                endpoint_keywords.append(endpoint)
+        
+        # Create suggestions based on analysis
+        for field in mentioned_fields:
+            for endpoint in endpoint_keywords:
+                # Check if this endpoint could provide the field
+                if self._endpoint_could_provide_field(endpoint, field):
+                    suggestions.append({
+                        'missing_field': field,
+                        'provider_endpoint': endpoint.endpoint_id,
+                        'provider_method': endpoint.method,
+                        'provider_path': endpoint.path,
+                        'confidence': self._calculate_suggestion_confidence(field, endpoint, llm_response),
+                        'resolution_type': 'field_dependency'
+                    })
+        
+        # Add sequence suggestions
+        sequence_suggestions = self._extract_sequence_suggestions(llm_response, available_endpoints)
+        suggestions.extend(sequence_suggestions)
+        
+        return suggestions
+    
+    def _endpoint_could_provide_field(self, endpoint: Any, field_name: str) -> bool:
+        """Check if an endpoint could provide a specific field."""
+        field_lower = field_name.lower()
+        
+        # Check if endpoint is a producer (POST, PUT)
+        if endpoint.method not in ['POST', 'PUT', 'PATCH']:
+            return False
+        
+        # Check response schemas for this field
+        for status_code, response in endpoint.responses.items():
+            if status_code.startswith('2'):  # Success responses
+                content = response.get('content', {})
+                for media_type, media_info in content.items():
+                    if 'application/json' in media_type:
+                        schema = media_info.get('schema', {})
+                        if self._schema_contains_field(schema, field_name):
+                            return True
+        
+        return False
+    
+    def _schema_contains_field(self, schema: Dict[str, Any], field_name: str) -> bool:
+        """Check if schema contains a specific field."""
+        field_lower = field_name.lower()
+        
+        if schema.get('type') == 'object':
+            properties = schema.get('properties', {})
+            for prop_name in properties.keys():
+                if field_lower in prop_name.lower() or prop_name.lower() in field_lower:
+                    return True
+        
+        elif schema.get('type') == 'array':
+            items = schema.get('items', {})
+            return self._schema_contains_field(items, field_name)
+        
+        return False
+    
+    def _calculate_suggestion_confidence(self, field: str, endpoint: Any, llm_response: str) -> float:
+        """Calculate confidence for a dependency resolution suggestion."""
+        base_confidence = 0.5
+        
+        # Boost for direct field mentions
+        if field.lower() in llm_response.lower():
+            base_confidence += 0.2
+        
+        # Boost for endpoint method appropriateness
+        if endpoint.method in ['POST', 'PUT']:
+            base_confidence += 0.1
+        
+        # Boost for service relationship
+        if any(keyword in llm_response.lower() for keyword in ['dependency', 'requires', 'needs', 'provides']):
+            base_confidence += 0.1
+        
+        return min(base_confidence, 1.0)
+    
+    def _extract_sequence_suggestions(self, llm_response: str, available_endpoints: List[Any]) -> List[Dict[str, Any]]:
+        """Extract sequence-based suggestions from LLM response."""
+        suggestions = []
+        
+        # Look for sequence indicators
+        sequence_keywords = ['first', 'before', 'after', 'then', 'next', 'prerequisite']
+        response_lower = llm_response.lower()
+        
+        if any(keyword in response_lower for keyword in sequence_keywords):
+            # Simple heuristic: suggest POST endpoints as prerequisites
+            for endpoint in available_endpoints:
+                if endpoint.method == 'POST':
+                    suggestions.append({
+                        'resolution_type': 'sequence_dependency',
+                        'prerequisite_endpoint': endpoint.endpoint_id,
+                        'prerequisite_method': endpoint.method,
+                        'prerequisite_path': endpoint.path,
+                        'confidence': 0.6,
+                        'reasoning': 'LLM suggests sequence dependency'
+                    })
+        
+        return suggestions
+    
+    def _calculate_error_resolution_confidence(self, llm_response: str) -> float:
+        """Calculate confidence in error resolution analysis."""
+        response_lower = llm_response.lower()
+        
+        confidence_indicators = [
+            'missing', 'required', 'dependency', 'needs', 'provides',
+            'id', 'key', 'reference', 'token', 'authentication'
+        ]
+        
+        score = sum(1 for indicator in confidence_indicators if indicator in response_lower)
+        return min(score / len(confidence_indicators), 1.0)
+    
+    def suggest_response_validation_improvements(self, validation_failures: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Suggest improvements for response validation based on failures."""
+        if not self.pipeline:
+            return {'suggestions': [], 'reasoning': 'LLM not available'}
+        
+        try:
+            # Analyze validation failures
+            failure_summary = self._summarize_validation_failures(validation_failures)
+            
+            # Create improvement prompt
+            prompt = f"""Analyze these API response validation failures and suggest improvements:
+
+Validation Failures Summary:
+- Total failures: {len(validation_failures)}
+- Common missing fields: {failure_summary['common_missing_fields']}
+- Common empty structures: {failure_summary['common_empty_structures']}
+- Affected endpoints: {failure_summary['affected_endpoints']}
+
+Task: Suggest how to improve the API test strategy to handle these validation issues.
+Focus on:
+1. Dependency resolution strategies
+2. Sequence optimization
+3. Data population approaches
+4. Error handling improvements
+
+Suggestions:"""
+            
+            response = self.pipeline(prompt, max_new_tokens=250, temperature=0.4)[0]['generated_text']
+            generated_text = response[len(prompt):].strip()
+            
+            return {
+                'suggestions': self._parse_improvement_suggestions(generated_text),
+                'reasoning': generated_text,
+                'failure_summary': failure_summary
+            }
+            
+        except Exception as e:
+            logger.warning(f"Failed to generate validation improvement suggestions: {e}")
+            return {'suggestions': [], 'reasoning': f'Analysis failed: {e}'}
+    
+    def _summarize_validation_failures(self, failures: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Summarize patterns in validation failures."""
+        summary = {
+            'common_missing_fields': [],
+            'common_empty_structures': [],
+            'affected_endpoints': [],
+            'failure_patterns': {}
+        }
+        
+        all_missing_fields = []
+        all_empty_structures = []
+        
+        for failure in failures:
+            summary['affected_endpoints'].append(failure.get('endpoint_id', 'unknown'))
+            all_missing_fields.extend(failure.get('missing_fields', []))
+            all_empty_structures.extend(failure.get('empty_structures', []))
+        
+        # Find most common issues
+        from collections import Counter
+        
+        field_counts = Counter(all_missing_fields)
+        structure_counts = Counter(all_empty_structures)
+        
+        summary['common_missing_fields'] = [field for field, count in field_counts.most_common(5)]
+        summary['common_empty_structures'] = [struct for struct, count in structure_counts.most_common(5)]
+        
+        return summary
+    
+    def _parse_improvement_suggestions(self, llm_response: str) -> List[Dict[str, Any]]:
+        """Parse improvement suggestions from LLM response."""
+        suggestions = []
+        
+        # Simple parsing based on keywords
+        lines = llm_response.split('\n')
+        current_suggestion = None
+        
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            
+            # Look for suggestion indicators
+            if any(indicator in line.lower() for indicator in ['suggest', 'recommend', 'improve', 'try']):
+                if current_suggestion:
+                    suggestions.append(current_suggestion)
+                
+                current_suggestion = {
+                    'type': 'improvement',
+                    'description': line,
+                    'details': []
+                }
+            elif current_suggestion:
+                current_suggestion['details'].append(line)
+        
+        # Add the last suggestion
+        if current_suggestion:
+            suggestions.append(current_suggestion)
+        
+        return suggestions
     
     def _should_use_llm(self) -> bool:
         """Check if LLM should be used based on environment and resources."""

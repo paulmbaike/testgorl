@@ -354,6 +354,343 @@ class SpecParser:
                 if endpoint.endpoint_id == endpoint_id:
                     return endpoint
         return None
+
+    def validate_response_against_schema(self, endpoint: EndpointInfo, response_data: Any, status_code: int) -> Dict[str, Any]:
+        """
+        Validate actual response data against expected OpenAPI schema.
+        
+        Args:
+            endpoint: The endpoint that was called
+            response_data: Actual response data received
+            status_code: HTTP status code received
+            
+        Returns:
+            Validation result with completeness analysis
+        """
+        validation_result = {
+            'is_valid': True,
+            'is_complete': True,
+            'missing_fields': [],
+            'empty_structures': [],
+            'schema_violations': [],
+            'completeness_score': 1.0,
+            'expected_schema': None,
+            'validation_details': {}
+        }
+        
+        # Get expected response schema for this status code
+        expected_schema = self._get_response_schema(endpoint, str(status_code))
+        if not expected_schema:
+            validation_result['validation_details']['no_schema'] = True
+            return validation_result
+        
+        validation_result['expected_schema'] = expected_schema
+        
+        # Validate structure against schema
+        schema_validation = self._validate_structure_against_schema(response_data, expected_schema)
+        validation_result.update(schema_validation)
+        
+        # Calculate completeness score
+        validation_result['completeness_score'] = self._calculate_completeness_score(
+            response_data, expected_schema, validation_result
+        )
+        
+        # Determine if response is complete enough
+        validation_result['is_complete'] = validation_result['completeness_score'] >= 0.7
+        
+        return validation_result
+    
+    def _get_response_schema(self, endpoint: EndpointInfo, status_code: str) -> Optional[Dict[str, Any]]:
+        """Extract response schema for given status code."""
+        response_def = endpoint.responses.get(status_code)
+        if not response_def:
+            # Try default response
+            response_def = endpoint.responses.get('default')
+        
+        if not response_def:
+            return None
+        
+        content = response_def.get('content', {})
+        for media_type, media_info in content.items():
+            if 'application/json' in media_type:
+                return media_info.get('schema', {})
+        
+        return None
+    
+    def _validate_structure_against_schema(self, data: Any, schema: Dict[str, Any]) -> Dict[str, Any]:
+        """Validate data structure against OpenAPI schema."""
+        result = {
+            'is_valid': True,
+            'is_complete': True,
+            'missing_fields': [],
+            'empty_structures': [],
+            'schema_violations': []
+        }
+        
+        schema_type = schema.get('type')
+        
+        if schema_type == 'object':
+            result.update(self._validate_object_schema(data, schema))
+        elif schema_type == 'array':
+            result.update(self._validate_array_schema(data, schema))
+        elif schema_type in ['string', 'number', 'integer', 'boolean']:
+            result.update(self._validate_primitive_schema(data, schema))
+        
+        return result
+    
+    def _validate_object_schema(self, data: Any, schema: Dict[str, Any]) -> Dict[str, Any]:
+        """Validate object data against object schema."""
+        result = {
+            'is_valid': True,
+            'is_complete': True,
+            'missing_fields': [],
+            'empty_structures': [],
+            'schema_violations': []
+        }
+        
+        if not isinstance(data, dict):
+            if data is None or data == "":
+                result['empty_structures'].append('root_object')
+                result['is_complete'] = False
+            else:
+                result['schema_violations'].append(f'Expected object, got {type(data).__name__}')
+                result['is_valid'] = False
+            return result
+        
+        # Check required fields
+        required_fields = schema.get('required', [])
+        properties = schema.get('properties', {})
+        
+        for field in required_fields:
+            if field not in data:
+                result['missing_fields'].append(field)
+                result['is_complete'] = False
+            elif data[field] is None or data[field] == "":
+                result['empty_structures'].append(field)
+                result['is_complete'] = False
+        
+        # Validate present fields against their schemas
+        for field_name, field_value in data.items():
+            if field_name in properties:
+                field_schema = properties[field_name]
+                field_result = self._validate_structure_against_schema(field_value, field_schema)
+                
+                if not field_result['is_valid']:
+                    result['is_valid'] = False
+                if not field_result['is_complete']:
+                    result['is_complete'] = False
+                
+                result['missing_fields'].extend([f"{field_name}.{f}" for f in field_result['missing_fields']])
+                result['empty_structures'].extend([f"{field_name}.{f}" for f in field_result['empty_structures']])
+                result['schema_violations'].extend([f"{field_name}.{v}" for v in field_result['schema_violations']])
+        
+        return result
+    
+    def _validate_array_schema(self, data: Any, schema: Dict[str, Any]) -> Dict[str, Any]:
+        """Validate array data against array schema."""
+        result = {
+            'is_valid': True,
+            'is_complete': True,
+            'missing_fields': [],
+            'empty_structures': [],
+            'schema_violations': []
+        }
+        
+        if not isinstance(data, list):
+            if data is None:
+                result['empty_structures'].append('root_array')
+                result['is_complete'] = False
+            else:
+                result['schema_violations'].append(f'Expected array, got {type(data).__name__}')
+                result['is_valid'] = False
+            return result
+        
+        # Empty array detection
+        if len(data) == 0:
+            result['empty_structures'].append('root_array')
+            result['is_complete'] = False
+            return result
+        
+        # Validate array items
+        items_schema = schema.get('items', {})
+        if items_schema:
+            for i, item in enumerate(data):
+                item_result = self._validate_structure_against_schema(item, items_schema)
+                if not item_result['is_valid']:
+                    result['is_valid'] = False
+                if not item_result['is_complete']:
+                    result['is_complete'] = False
+                
+                result['missing_fields'].extend([f"[{i}].{f}" for f in item_result['missing_fields']])
+                result['empty_structures'].extend([f"[{i}].{f}" for f in item_result['empty_structures']])
+                result['schema_violations'].extend([f"[{i}].{v}" for v in item_result['schema_violations']])
+        
+        return result
+    
+    def _validate_primitive_schema(self, data: Any, schema: Dict[str, Any]) -> Dict[str, Any]:
+        """Validate primitive data against primitive schema."""
+        result = {
+            'is_valid': True,
+            'is_complete': True,
+            'missing_fields': [],
+            'empty_structures': [],
+            'schema_violations': []
+        }
+        
+        schema_type = schema.get('type')
+        
+        # Check for null/empty values
+        if data is None or data == "":
+            result['empty_structures'].append('primitive_value')
+            result['is_complete'] = False
+            return result
+        
+        # Type validation
+        expected_types = {
+            'string': str,
+            'integer': int,
+            'number': (int, float),
+            'boolean': bool
+        }
+        
+        expected_type = expected_types.get(schema_type)
+        if expected_type and not isinstance(data, expected_type):
+            result['schema_violations'].append(
+                f'Expected {schema_type}, got {type(data).__name__}'
+            )
+            result['is_valid'] = False
+        
+        return result
+    
+    def _calculate_completeness_score(self, data: Any, schema: Dict[str, Any], validation_result: Dict[str, Any]) -> float:
+        """Calculate how complete the response is compared to expected schema."""
+        if not validation_result['is_valid']:
+            return 0.0
+        
+        # Base score
+        score = 1.0
+        
+        # Penalize missing required fields
+        missing_count = len(validation_result['missing_fields'])
+        if missing_count > 0:
+            score -= missing_count * 0.2
+        
+        # Penalize empty structures
+        empty_count = len(validation_result['empty_structures'])
+        if empty_count > 0:
+            score -= empty_count * 0.15
+        
+        # Penalize schema violations
+        violation_count = len(validation_result['schema_violations'])
+        if violation_count > 0:
+            score -= violation_count * 0.25
+        
+        return max(0.0, score)
+    
+    def extract_dependency_fields(self, endpoint: EndpointInfo) -> Dict[str, List[str]]:
+        """Extract fields that could be dependencies from endpoint definition."""
+        dependency_fields = {
+            'path_params': [],
+            'query_params': [],
+            'header_params': [],
+            'request_body_fields': [],
+            'response_body_fields': []
+        }
+        
+        # Extract from parameters
+        for param in endpoint.parameters:
+            param_name = param.get('name')
+            param_in = param.get('in')
+            
+            if param_in == 'path':
+                dependency_fields['path_params'].append(param_name)
+            elif param_in == 'query':
+                dependency_fields['query_params'].append(param_name)
+            elif param_in == 'header':
+                dependency_fields['header_params'].append(param_name)
+        
+        # Extract from request body
+        if endpoint.request_body:
+            content = endpoint.request_body.get('content', {})
+            for media_type, media_info in content.items():
+                if 'application/json' in media_type:
+                    schema = media_info.get('schema', {})
+                    fields = self._extract_schema_field_names(schema)
+                    dependency_fields['request_body_fields'].extend(fields)
+        
+        # Extract from response body
+        for status_code, response in endpoint.responses.items():
+            if status_code.startswith('2'):  # Success responses
+                content = response.get('content', {})
+                for media_type, media_info in content.items():
+                    if 'application/json' in media_type:
+                        schema = media_info.get('schema', {})
+                        fields = self._extract_schema_field_names(schema)
+                        dependency_fields['response_body_fields'].extend(fields)
+        
+        return dependency_fields
+    
+    def _extract_schema_field_names(self, schema: Dict[str, Any]) -> List[str]:
+        """Extract field names from schema for dependency tracking."""
+        fields = []
+        
+        schema_type = schema.get('type')
+        
+        if schema_type == 'object':
+            properties = schema.get('properties', {})
+            for field_name, field_schema in properties.items():
+                fields.append(field_name)
+                
+                # Recursively extract nested fields
+                if field_schema.get('type') == 'object':
+                    nested_fields = self._extract_schema_field_names(field_schema)
+                    fields.extend([f"{field_name}.{nested}" for nested in nested_fields])
+        
+        elif schema_type == 'array':
+            items_schema = schema.get('items', {})
+            if items_schema.get('type') == 'object':
+                item_fields = self._extract_schema_field_names(items_schema)
+                fields.extend([f"[].{field}" for field in item_fields])
+        
+        return fields
+    
+    def identify_critical_fields(self, endpoint: EndpointInfo) -> Dict[str, List[str]]:
+        """Identify critical fields (IDs, keys, references) for dependency resolution."""
+        critical_fields = {
+            'id_fields': [],
+            'reference_fields': [],
+            'required_fields': [],
+            'enum_fields': []
+        }
+        
+        # ID patterns to look for
+        id_patterns = ['id', 'uuid', 'key', 'ref', 'code', 'number']
+        
+        # Check all schemas associated with this endpoint
+        dependency_fields = self.extract_dependency_fields(endpoint)
+        
+        for field_category, fields in dependency_fields.items():
+            for field in fields:
+                field_lower = field.lower()
+                
+                # Identify ID-like fields
+                if any(pattern in field_lower for pattern in id_patterns):
+                    critical_fields['id_fields'].append(field)
+                
+                # Identify reference fields
+                if any(ref_word in field_lower for ref_word in ['ref', 'reference', 'link', 'url']):
+                    critical_fields['reference_fields'].append(field)
+        
+        # Extract required fields from schemas
+        if endpoint.request_body:
+            content = endpoint.request_body.get('content', {})
+            for media_type, media_info in content.items():
+                if 'application/json' in media_type:
+                    schema = media_info.get('schema', {})
+                    required = schema.get('required', [])
+                    critical_fields['required_fields'].extend(required)
+        
+        return critical_fields
     
     def get_schema_by_name(self, service_specs: List[ServiceSpec], schema_name: str, service_name: Optional[str] = None) -> Optional[SchemaInfo]:
         """Find schema by name, optionally filtering by service."""
