@@ -983,6 +983,229 @@ def validate(collection_file):
 
 
 @cli.command()
+@click.argument('spec_sources', nargs=-1, required=True)
+@click.option('--output', '-o', default='benchmark_report.json', help='Output benchmark report file')
+@click.option('--training-steps', default=10000, help='Number of RL training steps for benchmarking')
+@click.option('--num-sequences', default=5, help='Number of test sequences to generate for benchmarking')
+@click.option('--compare-baselines', is_flag=True, help='Include comparison with random and sequential baselines')
+@click.pass_context
+def benchmark(ctx, spec_sources, output, training_steps, num_sequences, compare_baselines):
+    """Comprehensive benchmarking of RL-Postman generator relationship."""
+    
+    print_banner()
+    print_section("📊 RL-Postman Benchmarking Analysis")
+    
+    try:
+        # Import benchmark analyzer
+        from .benchmark_analyzer import BenchmarkAnalyzer
+        
+        # Step 1: Parse specifications
+        print_info("Setting up benchmark environment...")
+        parser = SpecParser()
+        specs = parser.parse_specs(spec_sources)
+        
+        if not specs:
+            print_error("No valid specifications found.")
+            sys.exit(1)
+        
+        print_success(f"Loaded {len(specs)} service specification(s)")
+        
+        # Step 2: Setup dependency analysis
+        analyzer = DependencyAnalyzer()
+        analyzer.analyze_dependencies(specs)
+        hypotheses = analyzer.get_hypotheses()
+        
+        print_info(f"Analyzed {len(hypotheses)} dependency hypotheses")
+        
+        # Step 3: Train RL agent
+        print_info(f"Training RL agent ({training_steps} steps)...")
+        agent = RLAgent(specs, analyzer)
+        agent.train(total_timesteps=training_steps)
+        
+        # Step 4: Generate test sequences
+        print_info(f"Generating {num_sequences} test sequences...")
+        sequences = agent.generate_multiple_sequences(num_sequences)
+        
+        # Step 5: Generate Postman collection
+        print_info("Generating Postman collection...")
+        generator = PostmanGenerator(specs)
+        collection = generator.generate_collection(sequences, "Benchmark Test Collection")
+        
+        # Step 6: Comprehensive benchmark analysis
+        print_info("Running comprehensive benchmark analysis...")
+        benchmark_analyzer = BenchmarkAnalyzer(specs, analyzer)
+        metrics = benchmark_analyzer.analyze_rl_postman_relationship(agent, sequences, collection)
+        
+        # Step 7: Baseline comparisons (if requested)
+        comparisons = {}
+        if compare_baselines:
+            print_info("Comparing with baseline approaches...")
+            comparisons = benchmark_analyzer.compare_with_baselines(sequences)
+        
+        # Step 8: Generate comprehensive report
+        print_info("Generating benchmark report...")
+        report = benchmark_analyzer.generate_benchmark_report(metrics, comparisons)
+        
+        # Save report
+        with open(output, 'w') as f:
+            json.dump(report, f, indent=2)
+        
+        print_success(f"Benchmark report saved to {output}")
+        
+        # Display key metrics
+        print_section("📈 Key Benchmark Results")
+        print(f"🎯 Endpoint Coverage: {metrics.endpoint_coverage:.1%}")
+        print(f"🔗 Dependency Coverage: {metrics.dependency_coverage:.1%}")
+        print(f"⚡ Avg Traversal Time: {metrics.avg_time_to_traverse:.1f}s")
+        print(f"✅ Success Rate: {metrics.success_rate:.1%}")
+        print(f"🐛 Bug Discovery: {metrics.bug_discovery_rate:.1f} bugs/sequence")
+        print(f"🧠 Sequence Coherence: {metrics.sequence_coherence:.1%}")
+        print(f"📋 Collection Quality: {metrics.postman_collection_quality:.1%}")
+        
+        if compare_baselines:
+            print_section("📊 Baseline Comparisons")
+            coverage_imp = comparisons.get('coverage_improvement_vs_random', 0)
+            efficiency_imp = comparisons.get('efficiency_improvement_vs_random', 0)
+            print(f"📈 Coverage vs Random: +{coverage_imp:.1%}")
+            print(f"⚡ Efficiency vs Random: +{efficiency_imp:.1%}")
+        
+        # Display key insights
+        print_section("💡 Key Insights")
+        for insight in report.get('key_insights', []):
+            print(f"  • {insight}")
+        
+        print_section("🔧 Recommendations")
+        for rec in report.get('recommendations', []):
+            print(f"  • {rec}")
+        
+    except Exception as e:
+        print_error(f"Benchmarking failed: {e}")
+        if ctx.obj.get('verbose'):
+            import traceback
+            traceback.print_exc()
+        sys.exit(1)
+
+
+@cli.command()
+@click.argument('spec_sources', nargs=-1, required=True)
+@click.option('--short-steps', default=500, help='Number of training steps for short training')
+@click.option('--long-steps', default=5000, help='Number of training steps for long training')
+@click.option('--num-sequences', default=5, help='Number of test sequences to generate for evaluation')
+@click.option('--num-trials', default=2, help='Number of trials to run for statistical significance')
+@click.option('--output', '-o', default='training_comparison_report.json', help='Output report file')
+@click.option('--plot', is_flag=True, help='Generate comparison plots')
+@click.pass_context
+def compare_training(ctx, spec_sources, short_steps, long_steps, num_sequences, num_trials, output, plot):
+    """Compare RL agent performance with different training durations (e.g., 500 vs 5000 steps)."""
+    
+    print_banner()
+    print_section(f"🔬 Training Duration Comparison: {short_steps} vs {long_steps} Steps")
+    
+    try:
+        # Import training analyzer
+        from .training_analysis import TrainingAnalyzer
+        
+        # Step 1: Parse specifications
+        print_info("Setting up training comparison environment...")
+        parser = SpecParser()
+        specs = parser.parse_specs(spec_sources)
+        
+        if not specs:
+            print_error("No valid specifications found.")
+            sys.exit(1)
+        
+        print_success(f"Loaded {len(specs)} service specification(s)")
+        
+        # Step 2: Setup dependency analysis
+        analyzer = DependencyAnalyzer()
+        analyzer.analyze_dependencies(specs)
+        hypotheses = analyzer.get_hypotheses()
+        
+        print_info(f"Analyzed {len(hypotheses)} dependency hypotheses")
+        
+        # Step 3: Run training comparison
+        print_info(f"Running {num_trials} trial(s) for each training duration...")
+        print_warning(f"This will train {num_trials * 2} RL agents - may take several minutes")
+        
+        training_analyzer = TrainingAnalyzer(specs, analyzer)
+        comparison = training_analyzer.compare_training_durations(
+            short_steps=short_steps,
+            long_steps=long_steps,
+            num_sequences=num_sequences,
+            num_trials=num_trials
+        )
+        
+        # Step 4: Generate comprehensive report
+        print_info("Generating training comparison report...")
+        report = training_analyzer.generate_training_comparison_report(comparison)
+        
+        # Save report
+        with open(output, 'w') as f:
+            json.dump(report, f, indent=2)
+        
+        print_success(f"Training comparison report saved to {output}")
+        
+        # Step 5: Generate plots if requested
+        if plot:
+            print_info("Generating comparison plots...")
+            plot_path = output.replace('.json', '_plot.png')
+            training_analyzer.plot_training_comparison(comparison, plot_path)
+            print_success(f"Comparison plots saved to {plot_path}")
+        
+        # Display key results
+        print_section("📊 Training Comparison Results")
+        
+        print(f"📋 Short Training ({short_steps} steps):")
+        print(f"  🎯 Endpoint Coverage: {comparison.short_metrics.endpoint_coverage:.1%}")
+        print(f"  ⚡ Success Rate: {comparison.short_metrics.sequence_efficiency:.1%}")
+        print(f"  🐛 Bug Discovery: {comparison.short_metrics.bug_discovery_rate:.2f} bugs/sequence")
+        print(f"  ⏱️  Training Time: {comparison.short_training_time/60:.1f} minutes")
+        
+        print(f"\n📋 Long Training ({long_steps} steps):")
+        print(f"  🎯 Endpoint Coverage: {comparison.long_metrics.endpoint_coverage:.1%}")
+        print(f"  ⚡ Success Rate: {comparison.long_metrics.sequence_efficiency:.1%}")
+        print(f"  🐛 Bug Discovery: {comparison.long_metrics.bug_discovery_rate:.2f} bugs/sequence")
+        print(f"  ⏱️  Training Time: {comparison.long_training_time/60:.1f} minutes")
+        
+        print_section("📈 Performance Improvements")
+        print(f"  🎯 Coverage Improvement: {comparison.coverage_improvement:+.1%}")
+        print(f"  ⚡ Efficiency Improvement: {comparison.efficiency_improvement:+.1%}")
+        print(f"  🐛 Bug Discovery Improvement: {comparison.quality_improvement:+.1%}")
+        print(f"  ⏰ Time Cost: {comparison.time_efficiency_ratio:.1f}x longer")
+        
+        print_section("💡 Key Insights")
+        for insight in report.get('key_insights', []):
+            print(f"  • {insight}")
+        
+        print_section("🎯 Recommendation")
+        print(f"  {comparison.optimal_training_recommendation}")
+        
+        # Cost-benefit summary
+        cost_benefit = comparison.cost_benefit_analysis
+        if cost_benefit.get('roi_analysis', {}).get('high_value'):
+            print_success("✅ Long training provides high value - recommended for production")
+        elif cost_benefit.get('roi_analysis', {}).get('diminishing_returns'):
+            print_warning("⚠️ Diminishing returns detected - short training may be sufficient")
+        
+        print_section("🔧 Practical Guidelines")
+        guidelines = report.get('practical_guidelines', {})
+        print("When to use SHORT training:")
+        for guideline in guidelines.get('when_to_use_short_training', []):
+            print(f"  • {guideline}")
+        
+        print("\nWhen to use LONG training:")
+        for guideline in guidelines.get('when_to_use_long_training', []):
+            print(f"  • {guideline}")
+        
+    except Exception as e:
+        print_error(f"Training comparison failed: {e}")
+        if ctx.obj.get('verbose'):
+            import traceback
+            traceback.print_exc()
+        sys.exit(1)
+
+
+@cli.command()
 def examples():
     """Show usage examples with new response validation and error resolution features."""
     
