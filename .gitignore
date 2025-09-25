@@ -320,3 +320,4 @@ node_modules/
 .vscode-test
 
 # End of project-specific ignores 
+.cursor/
